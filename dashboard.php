@@ -59,6 +59,8 @@ for ($month = 1; $month <= 10; $month++) {
     <title>FitZone - Gym Management Dashboard</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=Playfair+Display:wght@700&display=swap" rel="stylesheet">
 </head>
 
@@ -83,6 +85,10 @@ for ($month = 1; $month <= 10; $month++) {
                     <i class="fas fa-users"></i>
                     <span>Manage Members</span>
                 </div>
+                <div class="nav-item" onclick="showPage('reports')">
+                    <i class="fas fa-file-alt"></i>
+                    <span>Generate Reports</span>
+                </div>
             </nav>
 
             <div class="sidebar-footer">
@@ -104,6 +110,7 @@ for ($month = 1; $month <= 10; $month++) {
                 </div>
             </div>
 
+            <!-- Dashboard Page -->
             <div id="dashboard" class="page active">
                 <div class="stats-grid">
                     <div class="stat-card">
@@ -167,6 +174,7 @@ for ($month = 1; $month <= 10; $month++) {
                 </div>
             </div>
 
+            <!-- Register Page -->
             <div id="register" class="page">
                 <div class="form-container">
                     <form id="registerForm">
@@ -207,6 +215,7 @@ for ($month = 1; $month <= 10; $month++) {
                 </div>
             </div>
 
+            <!-- Manage Page -->
             <div id="manage" class="page">
                 <div class="table-container">
                     <table class="table">
@@ -230,11 +239,116 @@ for ($month = 1; $month <= 10; $month++) {
                     </table>
                 </div>
             </div>
+
+            <!-- Reports Page -->
+            <div id="reports" class="page">
+                <div class="form-container" style="max-width: 100%;">
+                    <h3 style="margin-bottom: 25px; color: var(--text-light); display: flex; align-items: center; gap: 10px;">
+                        <i class="fas fa-filter" style="color: var(--primary-red);"></i>
+                        Filter New Member Reports
+                    </h3>
+                    
+                    <form id="reportFilterForm">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Start Date</label>
+                                <input type="date" id="startDate" name="start_date">
+                            </div>
+                            <div class="form-group">
+                                <label>End Date</label>
+                                <input type="date" id="endDate" name="end_date">
+                            </div>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Gender Filter</label>
+                                <select id="sexFilter" name="sex">
+                                    <option value="All">All Genders</option>
+                                    <option value="Male">Male</option>
+                                    <option value="Female">Female</option>
+                                    <option value="Other">Other</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>Status Filter</label>
+                                <select id="statusFilter" name="status">
+                                    <option value="all">All Status</option>
+                                    <option value="1">Active Only</option>
+                                    <option value="0">Inactive Only</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div style="display: flex; gap: 10px; margin-top: 20px;">
+                            <button type="button" class="btn-submit" onclick="generateReport()" style="flex: 1;">
+                                <i class="fas fa-search"></i> Generate Report
+                            </button>
+                            <button type="button" class="btn-submit" onclick="exportToPDF()" style="flex: 1; background: linear-gradient(135deg, #00D9FF, #0097B2);">
+                                <i class="fas fa-file-pdf"></i> Export to PDF
+                            </button>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- Report Summary -->
+                <div id="reportSummary" class="stats-grid" style="margin-top: 30px; display: none;">
+                    <div class="stat-card">
+                        <div class="stat-card-header">
+                            <div class="stat-card-title">Total New Members</div>
+                            <div class="stat-card-icon" style="color: var(--primary-red);"><i class="fas fa-users"></i></div>
+                        </div>
+                        <div class="stat-card-value" id="reportTotal">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-card-header">
+                            <div class="stat-card-title">Male Members</div>
+                            <div class="stat-card-icon" style="color: var(--accent-blue);"><i class="fas fa-male"></i></div>
+                        </div>
+                        <div class="stat-card-value" id="reportMale">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-card-header">
+                            <div class="stat-card-title">Female Members</div>
+                            <div class="stat-card-icon" style="color: var(--accent-purple);"><i class="fas fa-female"></i></div>
+                        </div>
+                        <div class="stat-card-value" id="reportFemale">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-card-header">
+                            <div class="stat-card-title">Active Members</div>
+                            <div class="stat-card-icon" style="color: var(--success);"><i class="fas fa-check-circle"></i></div>
+                        </div>
+                        <div class="stat-card-value" id="reportActive">0</div>
+                    </div>
+                </div>
+
+                <!-- Report Table -->
+                <div id="reportTableContainer" class="table-container" style="margin-top: 30px; display: none;">
+                    <table class="table" id="reportTable">
+                        <thead>
+                            <tr>
+                                <th>Member ID</th>
+                                <th>Full Name</th>
+                                <th>Email</th>
+                                <th>Phone</th>
+                                <th>Gender</th>
+                                <th>Birthday</th>
+                                <th>Registration Date</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="reportTableBody">
+                        </tbody>
+                    </table>
+                </div>
+            </div>
         </main>
     </div>
 
     <script>
         let allMembers = [];
+        let reportData = [];
 
         function showPage(pageName) {
             document.querySelectorAll('.page').forEach(page => {
@@ -247,7 +361,6 @@ for ($month = 1; $month <= 10; $month++) {
 
             document.getElementById(pageName).classList.add('active');
 
-            // Fix: Use querySelectorAll and find the clicked item
             document.querySelectorAll('.nav-item').forEach(item => {
                 if (item.getAttribute('onclick') && item.getAttribute('onclick').includes(pageName)) {
                     item.classList.add('active');
@@ -257,11 +370,11 @@ for ($month = 1; $month <= 10; $month++) {
             const titles = {
                 'dashboard': 'Dashboard',
                 'register': 'Register Member',
-                'manage': 'Manage Members'
+                'manage': 'Manage Members',
+                'reports': 'Generate Reports'
             };
             document.getElementById('page-title').textContent = titles[pageName];
 
-            // Show/hide search box based on page
             const searchBox = document.getElementById('searchBox');
             if (pageName === 'manage') {
                 searchBox.style.display = 'block';
@@ -270,6 +383,151 @@ for ($month = 1; $month <= 10; $month++) {
                 searchBox.style.display = 'none';
                 searchBox.value = '';
             }
+        }
+
+        function generateReport() {
+            const startDate = document.getElementById('startDate').value;
+            const endDate = document.getElementById('endDate').value;
+            const sex = document.getElementById('sexFilter').value;
+            const status = document.getElementById('statusFilter').value;
+
+            if (!startDate || !endDate) {
+                showMessage('error', 'Please select both start and end dates');
+                return;
+            }
+
+            const params = new URLSearchParams({
+                action: 'get_new_members',
+                start_date: startDate,
+                end_date: endDate,
+                sex: sex,
+                status: status
+            });
+
+            fetch(`api_reports.php?${params}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        reportData = data.data;
+                        displayReportData(data.data, data.summary);
+                    } else {
+                        showMessage('error', 'Failed to generate report');
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    showMessage('error', 'An error occurred while generating report');
+                });
+        }
+
+        function displayReportData(members, summary) {
+            // Update summary cards
+            document.getElementById('reportTotal').textContent = summary.total;
+            document.getElementById('reportMale').textContent = summary.male;
+            document.getElementById('reportFemale').textContent = summary.female;
+            document.getElementById('reportActive').textContent = summary.active;
+            
+            document.getElementById('reportSummary').style.display = 'grid';
+            document.getElementById('reportTableContainer').style.display = 'block';
+
+            // Populate table
+            const tbody = document.getElementById('reportTableBody');
+            
+            if (members.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" style="text-align: center;">No members found for selected criteria</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = members.map(member => `
+                <tr>
+                    <td>#MEM-${String(member.id).padStart(3, '0')}</td>
+                    <td>${member.fullname}</td>
+                    <td>${member.email}</td>
+                    <td>${member.mobile_number || 'N/A'}</td>
+                    <td>${member.sex}</td>
+                    <td>${formatDate(member.birthday)}</td>
+                    <td>${formatDate(member.created_at)}</td>
+                    <td><span style="color: ${member.is_active ? 'var(--success)' : 'var(--warning)'};">●</span> ${member.is_active ? 'Active' : 'Inactive'}</td>
+                </tr>
+            `).join('');
+
+            showMessage('success', `Report generated successfully! Found ${members.length} member(s)`);
+        }
+
+        function exportToPDF() {
+            if (reportData.length === 0) {
+                showMessage('error', 'Please generate a report first before exporting');
+                return;
+            }
+
+            const { jsPDF } = window.jspdf;
+            const doc = new jsPDF();
+
+            // Add title
+            doc.setFontSize(20);
+            doc.setTextColor(231, 76, 60);
+            doc.text('Catague Fitness Gym', 105, 20, { align: 'center' });
+            
+            doc.setFontSize(14);
+            doc.setTextColor(0, 0, 0);
+            doc.text('New Member Registration Report', 105, 30, { align: 'center' });
+
+            // Add report details
+            doc.setFontSize(10);
+            const startDate = document.getElementById('startDate').value;
+            const endDate = document.getElementById('endDate').value;
+            doc.text(`Report Period: ${startDate} to ${endDate}`, 14, 40);
+            doc.text(`Generated: ${new Date().toLocaleString()}`, 14, 46);
+
+            // Add summary
+            doc.setFontSize(12);
+            doc.setTextColor(231, 76, 60);
+            doc.text('Summary', 14, 56);
+            
+            doc.setFontSize(10);
+            doc.setTextColor(0, 0, 0);
+            doc.text(`Total Members: ${document.getElementById('reportTotal').textContent}`, 14, 64);
+            doc.text(`Male: ${document.getElementById('reportMale').textContent}`, 70, 64);
+            doc.text(`Female: ${document.getElementById('reportFemale').textContent}`, 110, 64);
+            doc.text(`Active: ${document.getElementById('reportActive').textContent}`, 150, 64);
+
+            // Prepare table data
+            const tableData = reportData.map(member => [
+                `#MEM-${String(member.id).padStart(3, '0')}`,
+                member.fullname,
+                member.email,
+                member.mobile_number || 'N/A',
+                member.sex,
+                formatDate(member.birthday),
+                formatDate(member.created_at),
+                member.is_active ? 'Active' : 'Inactive'
+            ]);
+
+            // Add table
+            doc.autoTable({
+                startY: 72,
+                head: [['ID', 'Name', 'Email', 'Phone', 'Gender', 'Birthday', 'Reg. Date', 'Status']],
+                body: tableData,
+                theme: 'grid',
+                headStyles: { 
+                    fillColor: [231, 76, 60],
+                    textColor: [255, 255, 255],
+                    fontStyle: 'bold'
+                },
+                styles: {
+                    fontSize: 8,
+                    cellPadding: 3
+                },
+                alternateRowStyles: {
+                    fillColor: [245, 245, 245]
+                }
+            });
+
+            // Save PDF
+            const filename = `new_members_report_${startDate}_to_${endDate}.pdf`;
+            doc.save(filename);
+            
+            showMessage('success', 'Report exported to PDF successfully!');
         }
 
         function loadMembers() {
@@ -440,6 +698,14 @@ for ($month = 1; $month <= 10; $month++) {
 
         // Initialize chart and load members on page load
         window.addEventListener('DOMContentLoaded', function() {
+            // Set default dates for report (current month)
+            const today = new Date();
+            const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+            const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+            
+            document.getElementById('startDate').valueAsDate = firstDay;
+            document.getElementById('endDate').valueAsDate = lastDay;
+
             // Initialize the chart
             const chartLabels = <?php echo json_encode($chartLabels); ?>;
             const chartData = <?php echo json_encode($chartData); ?>;
