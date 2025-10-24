@@ -23,6 +23,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $_SESSION['user_id'] = $user['id'];
             $_SESSION['username'] = $user['username'];
             $_SESSION['fullname'] = $user['fullname'];
+            $_SESSION['email'] = $user['email'];
             $_SESSION['role'] = $user['role'];
             
             $updateStmt = $conn->prepare("UPDATE users SET updated_at = NOW() WHERE id = ?");
@@ -39,7 +40,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } 
     elseif ($action === 'logout') {
         session_destroy();
-        jsonResponse(true, 'Logged out successfully', ['redirect' => 'index.php']);
+        jsonResponse(true, 'Logged out successfully', ['redirect' => 'login.php']);
     }
 }
 ?>

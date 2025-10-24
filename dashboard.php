@@ -1,75 +1,90 @@
 <?php
-session_start();
+require_once 'config.php';
+requireLogin();
 
-if (!isset($_SESSION['user_id'])) {
-    header('Location: login.php');
-    exit();
-}
-
-$servername = "localhost";
-$username = "root";
-$password = "";
-$dbname = "bsis4a_jc";
-
-$conn = new mysqli($servername, $username, $password, $dbname);
-if ($conn->connect_error) {
-    die("Connection failed: " . $conn->connect_error);
-}
-
+$conn = getDBConnection();
 $user_id = $_SESSION['user_id'];
-$sql = "SELECT fullname, email, role FROM users WHERE id = ?";
-$stmt = $conn->prepare($sql);
-$stmt->bind_param("i", $user_id);
-$stmt->execute();
-$result = $stmt->get_result();
-$user = $result->fetch_assoc();
-$stmt->close();
 
-$totalQuery = $conn->query("SELECT COUNT(*) as total FROM users WHERE role = 'staff'");
-$total = $totalQuery->fetch_assoc()['total'];
+// Get user info
+$userQuery = $conn->prepare("SELECT fullname, email, role FROM users WHERE id = ?");
+$userQuery->bind_param("i", $user_id);
+$userQuery->execute();
+$user = $userQuery->fetch_assoc();
 
-$activeQuery = $conn->query("SELECT COUNT(*) as active FROM users WHERE role = 'staff' AND is_active = 1");
-$active = $activeQuery->fetch_assoc()['active'];
+// Get statistics
+$totalStudents = $conn->query("SELECT COUNT(*) as total FROM students WHERE is_active = 1")->fetch_assoc()['total'];
 
-$inactive = $total - $active;
+$today = date('Y-m-d');
+$todayPresent = $conn->query("SELECT COUNT(DISTINCT student_id) as present FROM attendance WHERE attendance_date = '$today' AND status IN ('Present', 'Late')")->fetch_assoc()['present'];
 
-$chartData = [];
+$todayAbsent = $totalStudents - $todayPresent;
+
+// Get attendance rate for current month
+$currentMonth = date('Y-m');
+$monthAttendance = $conn->query("SELECT 
+    COUNT(CASE WHEN status IN ('Present', 'Late') THEN 1 END) as present_count,
+    COUNT(*) as total_count
+    FROM attendance 
+    WHERE DATE_FORMAT(attendance_date, '%Y-%m') = '$currentMonth'")->fetch_assoc();
+
+$attendanceRate = $monthAttendance['total_count'] > 0 
+    ? round(($monthAttendance['present_count'] / $monthAttendance['total_count']) * 100, 1) 
+    : 0;
+
+// Get recent attendance (last 7 days)
+$recentQuery = $conn->query("SELECT 
+    DATE_FORMAT(attendance_date, '%b %d') as date_label,
+    COUNT(CASE WHEN status IN ('Present', 'Late') THEN 1 END) as present,
+    COUNT(CASE WHEN status = 'Absent' THEN 1 END) as absent
+    FROM attendance 
+    WHERE attendance_date >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
+    GROUP BY attendance_date
+    ORDER BY attendance_date ASC");
+
 $chartLabels = [];
-$currentYear = 2025;
+$presentData = [];
+$absentData = [];
 
-for ($month = 1; $month <= 10; $month++) {
-    $monthStr = str_pad($month, 2, '0', STR_PAD_LEFT);
-    $yearMonth = "$currentYear-$monthStr";
-    $monthLabel = date('M', mktime(0, 0, 0, $month, 1));
-
-    $monthQuery = $conn->query("SELECT COUNT(*) as count FROM users WHERE role = 'staff' AND DATE_FORMAT(created_at, '%Y-%m') = '$yearMonth'");
-    $monthCount = $monthQuery->fetch_assoc()['count'];
-
-    $chartLabels[] = $monthLabel;
-    $chartData[] = $monthCount;
+while ($row = $recentQuery->fetch_assoc()) {
+    $chartLabels[] = $row['date_label'];
+    $presentData[] = $row['present'];
+    $absentData[] = $row['absent'];
 }
+
+// Get latest attendance records
+$latestRecords = $conn->query("SELECT 
+    a.id,
+    s.student_id,
+    CONCAT(s.firstname, ' ', s.lastname) as student_name,
+    s.course,
+    s.year_level,
+    a.attendance_date,
+    a.time_in,
+    a.status
+    FROM attendance a
+    JOIN students s ON a.student_id = s.id
+    ORDER BY a.created_at DESC
+    LIMIT 10");
+
+$conn->close();
 ?>
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link href="loginstyle.css" rel="stylesheet">
-    <title>FitZone - Gym Management Dashboard</title>
+    <title>Dashboard - Student Attendance System</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="dashboard.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=Playfair+Display:wght@700&display=swap" rel="stylesheet">
 </head>
-
 <body>
     <div class="dashboard-container">
         <aside class="sidebar">
             <div class="sidebar-header">
-                <h2>Catague Fitness Gym</h2>
-                <p>Gym Manager</p>
+                <h2>Attendance System</h2>
+                <p><?php echo htmlspecialchars($user['role']); ?></p>
             </div>
 
             <nav class="sidebar-nav">
@@ -77,17 +92,21 @@ for ($month = 1; $month <= 10; $month++) {
                     <i class="fas fa-chart-line"></i>
                     <span>Dashboard</span>
                 </div>
-                <div class="nav-item" onclick="showPage('register')">
-                    <i class="fas fa-user-plus"></i>
-                    <span>Register Member</span>
-                </div>
-                <div class="nav-item" onclick="showPage('manage')">
+                <div class="nav-item" onclick="showPage('students')">
                     <i class="fas fa-users"></i>
-                    <span>Manage Members</span>
+                    <span>Students</span>
+                </div>
+                <div class="nav-item" onclick="showPage('attendance')">
+                    <i class="fas fa-clipboard-check"></i>
+                    <span>Mark Attendance</span>
+                </div>
+                <div class="nav-item" onclick="showPage('records')">
+                    <i class="fas fa-history"></i>
+                    <span>Attendance Records</span>
                 </div>
                 <div class="nav-item" onclick="showPage('reports')">
                     <i class="fas fa-file-alt"></i>
-                    <span>Generate Reports</span>
+                    <span>Reports</span>
                 </div>
             </nav>
 
@@ -102,7 +121,10 @@ for ($month = 1; $month <= 10; $month++) {
             <div class="header">
                 <h1 class="page-title" id="page-title">Dashboard</h1>
                 <div class="header-actions">
-                    <input type="text" class="search-box" id="searchBox" placeholder="Search members..." style="display: none;">
+                    <div class="date-display">
+                        <i class="fas fa-calendar-day"></i>
+                        <span><?php echo date('l, F d, Y'); ?></span>
+                    </div>
                     <div class="user-profile">
                         <div class="user-avatar"><?php echo strtoupper(substr($user['fullname'], 0, 2)); ?></div>
                         <span><?php echo htmlspecialchars($user['fullname']); ?></span>
@@ -110,246 +132,155 @@ for ($month = 1; $month <= 10; $month++) {
                 </div>
             </div>
 
+            <div id="message-container"></div>
+
             <!-- Dashboard Page -->
             <div id="dashboard" class="page active">
                 <div class="stats-grid">
                     <div class="stat-card">
                         <div class="stat-card-header">
-                            <div class="stat-card-title">Total Members</div>
-                            <div class="stat-card-icon" style="color: var(--primary-red);"><i class="fas fa-users"></i></div>
+                            <div class="stat-card-title">Total Students</div>
+                            <div class="stat-card-icon" style="color: var(--primary-blue);">
+                                <i class="fas fa-user-graduate"></i>
+                            </div>
                         </div>
-                        <div class="stat-card-value"><?php echo $total; ?></div>
-                        <div class="stat-card-change"><i class="fas fa-arrow-up"></i> All registered</div>
+                        <div class="stat-card-value"><?php echo $totalStudents; ?></div>
+                        <div class="stat-card-change">
+                            <i class="fas fa-users"></i> Active students
+                        </div>
                     </div>
 
                     <div class="stat-card">
                         <div class="stat-card-header">
-                            <div class="stat-card-title">Active Members</div>
-                            <div class="stat-card-icon" style="color: var(--success);"><i class="fas fa-user-check"></i></div>
+                            <div class="stat-card-title">Present Today</div>
+                            <div class="stat-card-icon" style="color: var(--success);">
+                                <i class="fas fa-user-check"></i>
+                            </div>
                         </div>
-                        <div class="stat-card-value"><?php echo $active; ?></div>
-                        <div class="stat-card-change"><i class="fas fa-arrow-up"></i> Currently active</div>
+                        <div class="stat-card-value"><?php echo $todayPresent; ?></div>
+                        <div class="stat-card-change">
+                            <i class="fas fa-arrow-up"></i> <?php echo date('F d, Y'); ?>
+                        </div>
                     </div>
 
                     <div class="stat-card">
                         <div class="stat-card-header">
-                            <div class="stat-card-title">Inactive Members</div>
-                            <div class="stat-card-icon" style="color: var(--warning);"><i class="fas fa-user-clock"></i></div>
+                            <div class="stat-card-title">Absent Today</div>
+                            <div class="stat-card-icon" style="color: var(--error);">
+                                <i class="fas fa-user-times"></i>
+                            </div>
                         </div>
-                        <div class="stat-card-value"><?php echo $inactive; ?></div>
-                        <div class="stat-card-change"><i class="fas fa-arrow-down"></i> Not active</div>
+                        <div class="stat-card-value"><?php echo $todayAbsent; ?></div>
+                        <div class="stat-card-change">
+                            <i class="fas fa-exclamation-triangle"></i> Needs attention
+                        </div>
+                    </div>
+
+                    <div class="stat-card">
+                        <div class="stat-card-header">
+                            <div class="stat-card-title">Attendance Rate</div>
+                            <div class="stat-card-icon" style="color: var(--accent-purple);">
+                                <i class="fas fa-percentage"></i>
+                            </div>
+                        </div>
+                        <div class="stat-card-value"><?php echo $attendanceRate; ?>%</div>
+                        <div class="stat-card-change">
+                            <i class="fas fa-calendar-alt"></i> This month
+                        </div>
                     </div>
                 </div>
 
-                <div class="chart-container" style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 30px; border-radius: 16px; margin-top: 25px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1);">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px;">
-                        <h3 style="margin: 0; color: #ffffff; font-size: 20px; font-weight: 600; display: flex; align-items: center;">
-                            <i class="fas fa-chart-line" style="color: #e74c3c; margin-right: 12px; font-size: 22px;"></i>
-                            New Member Registration Trend (2025)
-                        </h3>
-                        <div style="background: rgba(231, 76, 60, 0.15); padding: 8px 16px; border-radius: 8px; border: 1px solid rgba(231, 76, 60, 0.3);">
-                            <span style="color: #e74c3c; font-weight: 600; font-size: 14px;">
-                                <i class="fas fa-calendar-alt" style="margin-right: 6px;"></i>
-                                Jan - Oct
-                            </span>
-                        </div>
-                    </div>
-                    <div style="background: rgba(255,255,255,0.05); padding: 20px; border-radius: 12px; backdrop-filter: blur(10px);">
-                        <canvas id="memberChart" height="80"></canvas>
-                    </div>
-                    <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.1); display: flex; gap: 30px; justify-content: center;">
-                        <div style="text-align: center;">
-                            <div style="color: rgba(255,255,255,0.6); font-size: 12px; margin-bottom: 5px;">Total New Members</div>
-                            <div style="color: #ffffff; font-size: 24px; font-weight: 700;" id="totalNewMembers">0</div>
-                        </div>
-                        <div style="text-align: center;">
-                            <div style="color: rgba(255,255,255,0.6); font-size: 12px; margin-bottom: 5px;">Average per Month</div>
-                            <div style="color: #e74c3c; font-size: 24px; font-weight: 700;" id="avgPerMonth">0</div>
-                        </div>
-                        <div style="text-align: center;">
-                            <div style="color: rgba(255,255,255,0.6); font-size: 12px; margin-bottom: 5px;">Peak Month</div>
-                            <div style="color: #3498db; font-size: 24px; font-weight: 700;" id="peakMonth">N/A</div>
-                        </div>
-                    </div>
+                <div class="chart-container">
+                    <h3 style="margin-bottom: 20px; color: var(--text-light); display: flex; align-items: center; gap: 10px;">
+                        <i class="fas fa-chart-area" style="color: var(--primary-blue);"></i>
+                        7-Day Attendance Trend
+                    </h3>
+                    <canvas id="attendanceChart" height="80"></canvas>
                 </div>
-            </div>
 
-            <!-- Register Page -->
-            <div id="register" class="page">
-                <div class="form-container">
-                    <form id="registerForm">
-                        <div class="form-group">
-                            <label>Full Name *</label>
-                            <input type="text" name="fullname" placeholder="Enter full name" required>
-                        </div>
-
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label>Email Address *</label>
-                                <input type="email" name="email" placeholder="email@example.com" required>
-                            </div>
-                            <div class="form-group">
-                                <label>Phone Number *</label>
-                                <input type="tel" name="phone" placeholder="09171234567" required>
-                            </div>
-                        </div>
-
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label>Date of Birth *</label>
-                                <input type="date" name="birthday" required>
-                            </div>
-                            <div class="form-group">
-                                <label>Gender *</label>
-                                <select name="sex" required>
-                                    <option value="">Select gender</option>
-                                    <option value="Male">Male</option>
-                                    <option value="Female">Female</option>
-                                    <option value="Other">Other</option>
-                                </select>
-                            </div>
-                        </div>
-
-                        <button type="submit" class="btn-submit">Register Member</button>
-                    </form>
-                </div>
-            </div>
-
-            <!-- Manage Page -->
-            <div id="manage" class="page">
-                <div class="table-container">
+                <div class="table-container" style="margin-top: 30px;">
+                    <h3 style="margin-bottom: 20px; color: var(--text-light); display: flex; align-items: center; gap: 10px; padding: 0 20px;">
+                        <i class="fas fa-clock" style="color: var(--accent-green);"></i>
+                        Recent Attendance Records
+                    </h3>
                     <table class="table">
                         <thead>
                             <tr>
-                                <th>Member ID</th>
+                                <th>Student ID</th>
                                 <th>Name</th>
-                                <th>Email</th>
-                                <th>Phone</th>
-                                <th>Birthday</th>
-                                <th>Join Date</th>
+                                <th>Course</th>
+                                <th>Year</th>
+                                <th>Date</th>
+                                <th>Time In</th>
                                 <th>Status</th>
-                                <th>Actions</th>
                             </tr>
                         </thead>
-                        <tbody id="membersTableBody">
-                            <tr>
-                                <td colspan="8" style="text-align: center;">Loading members...</td>
-                            </tr>
+                        <tbody>
+                            <?php if ($latestRecords->num_rows > 0): ?>
+                                <?php while ($record = $latestRecords->fetch_assoc()): ?>
+                                    <tr>
+                                        <td><?php echo htmlspecialchars($record['student_id']); ?></td>
+                                        <td><?php echo htmlspecialchars($record['student_name']); ?></td>
+                                        <td><?php echo htmlspecialchars($record['course']); ?></td>
+                                        <td><?php echo htmlspecialchars($record['year_level']); ?></td>
+                                        <td><?php echo formatDate($record['attendance_date']); ?></td>
+                                        <td><?php echo formatTime($record['time_in']); ?></td>
+                                        <td>
+                                            <span class="status-badge status-<?php echo strtolower($record['status']); ?>">
+                                                <?php echo $record['status']; ?>
+                                            </span>
+                                        </td>
+                                    </tr>
+                                <?php endwhile; ?>
+                            <?php else: ?>
+                                <tr>
+                                    <td colspan="7" style="text-align: center;">No attendance records yet</td>
+                                </tr>
+                            <?php endif; ?>
                         </tbody>
                     </table>
+                </div>
+            </div>
+
+            <!-- Students Page -->
+            <div id="students" class="page">
+                <div style="text-align: center; padding: 50px; color: var(--text-secondary);">
+                    <i class="fas fa-users" style="font-size: 3rem; margin-bottom: 20px;"></i>
+                    <h3>Students Management</h3>
+                    <p>This page will contain student list and management features</p>
+                </div>
+            </div>
+
+            <!-- Attendance Page -->
+            <div id="attendance" class="page">
+                <div style="text-align: center; padding: 50px; color: var(--text-secondary);">
+                    <i class="fas fa-clipboard-check" style="font-size: 3rem; margin-bottom: 20px;"></i>
+                    <h3>Mark Attendance</h3>
+                    <p>This page will contain attendance marking interface</p>
+                </div>
+            </div>
+
+            <!-- Records Page -->
+            <div id="records" class="page">
+                <div style="text-align: center; padding: 50px; color: var(--text-secondary);">
+                    <i class="fas fa-history" style="font-size: 3rem; margin-bottom: 20px;"></i>
+                    <h3>Attendance Records</h3>
+                    <p>This page will contain all attendance records</p>
                 </div>
             </div>
 
             <!-- Reports Page -->
             <div id="reports" class="page">
-                <div class="form-container" style="max-width: 100%;">
-                    <h3 style="margin-bottom: 25px; color: var(--text-light); display: flex; align-items: center; gap: 10px;">
-                        <i class="fas fa-filter" style="color: var(--primary-red);"></i>
-                        Filter New Member Reports
-                    </h3>
-                    
-                    <form id="reportFilterForm">
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label>Start Date</label>
-                                <input type="date" id="startDate" name="start_date">
-                            </div>
-                            <div class="form-group">
-                                <label>End Date</label>
-                                <input type="date" id="endDate" name="end_date">
-                            </div>
-                        </div>
-
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label>Gender Filter</label>
-                                <select id="sexFilter" name="sex">
-                                    <option value="All">All Genders</option>
-                                    <option value="Male">Male</option>
-                                    <option value="Female">Female</option>
-                                    <option value="Other">Other</option>
-                                </select>
-                            </div>
-                            <div class="form-group">
-                                <label>Status Filter</label>
-                                <select id="statusFilter" name="status">
-                                    <option value="all">All Status</option>
-                                    <option value="1">Active Only</option>
-                                    <option value="0">Inactive Only</option>
-                                </select>
-                            </div>
-                        </div>
-
-                        <div style="display: flex; gap: 10px; margin-top: 20px;">
-                            <button type="button" class="btn-submit" onclick="generateReport()" style="flex: 1;">
-                                <i class="fas fa-search"></i> Generate Report
-                            </button>
-                            <button type="button" class="btn-submit" onclick="exportToPDF()" style="flex: 1; background: linear-gradient(135deg, #00D9FF, #0097B2);">
-                                <i class="fas fa-file-pdf"></i> Export to PDF
-                            </button>
-                        </div>
-                    </form>
-                </div>
-
-                <!-- Report Summary -->
-                <div id="reportSummary" class="stats-grid" style="margin-top: 30px; display: none;">
-                    <div class="stat-card">
-                        <div class="stat-card-header">
-                            <div class="stat-card-title">Total New Members</div>
-                            <div class="stat-card-icon" style="color: var(--primary-red);"><i class="fas fa-users"></i></div>
-                        </div>
-                        <div class="stat-card-value" id="reportTotal">0</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-card-header">
-                            <div class="stat-card-title">Male Members</div>
-                            <div class="stat-card-icon" style="color: var(--accent-blue);"><i class="fas fa-male"></i></div>
-                        </div>
-                        <div class="stat-card-value" id="reportMale">0</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-card-header">
-                            <div class="stat-card-title">Female Members</div>
-                            <div class="stat-card-icon" style="color: var(--accent-purple);"><i class="fas fa-female"></i></div>
-                        </div>
-                        <div class="stat-card-value" id="reportFemale">0</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-card-header">
-                            <div class="stat-card-title">Active Members</div>
-                            <div class="stat-card-icon" style="color: var(--success);"><i class="fas fa-check-circle"></i></div>
-                        </div>
-                        <div class="stat-card-value" id="reportActive">0</div>
-                    </div>
-                </div>
-
-                <!-- Report Table -->
-                <div id="reportTableContainer" class="table-container" style="margin-top: 30px; display: none;">
-                    <table class="table" id="reportTable">
-                        <thead>
-                            <tr>
-                                <th>Member ID</th>
-                                <th>Full Name</th>
-                                <th>Email</th>
-                                <th>Phone</th>
-                                <th>Gender</th>
-                                <th>Birthday</th>
-                                <th>Registration Date</th>
-                                <th>Status</th>
-                            </tr>
-                        </thead>
-                        <tbody id="reportTableBody">
-                        </tbody>
-                    </table>
+                <div style="text-align: center; padding: 50px; color: var(--text-secondary);">
+                    <i class="fas fa-file-alt" style="font-size: 3rem; margin-bottom: 20px;"></i>
+                    <h3>Reports</h3>
+                    <p>This page will contain reports and analytics</p>
                 </div>
             </div>
         </main>
     </div>
 
     <script>
-        let allMembers = [];
-        let reportData = [];
-
         function showPage(pageName) {
             document.querySelectorAll('.page').forEach(page => {
                 page.classList.remove('active');
@@ -369,325 +300,12 @@ for ($month = 1; $month <= 10; $month++) {
 
             const titles = {
                 'dashboard': 'Dashboard',
-                'register': 'Register Member',
-                'manage': 'Manage Members',
-                'reports': 'Generate Reports'
+                'students': 'Students Management',
+                'attendance': 'Mark Attendance',
+                'records': 'Attendance Records',
+                'reports': 'Reports'
             };
             document.getElementById('page-title').textContent = titles[pageName];
-
-            const searchBox = document.getElementById('searchBox');
-            if (pageName === 'manage') {
-                searchBox.style.display = 'block';
-                loadMembers();
-            } else {
-                searchBox.style.display = 'none';
-                searchBox.value = '';
-            }
-        }
-
-        function generateReport() {
-            const startDate = document.getElementById('startDate').value;
-            const endDate = document.getElementById('endDate').value;
-            const sex = document.getElementById('sexFilter').value;
-            const status = document.getElementById('statusFilter').value;
-
-            if (!startDate || !endDate) {
-                showMessage('error', 'Please select both start and end dates');
-                return;
-            }
-
-            const params = new URLSearchParams({
-                action: 'get_new_members',
-                start_date: startDate,
-                end_date: endDate,
-                sex: sex,
-                status: status
-            });
-
-            fetch(`api_reports.php?${params}`)
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        reportData = data.data;
-                        displayReportData(data.data, data.summary);
-                    } else {
-                        showMessage('error', 'Failed to generate report');
-                    }
-                })
-                .catch(error => {
-                    console.error('Error:', error);
-                    showMessage('error', 'An error occurred while generating report');
-                });
-        }
-
-        function displayReportData(members, summary) {
-            // Update summary cards
-            document.getElementById('reportTotal').textContent = summary.total;
-            document.getElementById('reportMale').textContent = summary.male;
-            document.getElementById('reportFemale').textContent = summary.female;
-            document.getElementById('reportActive').textContent = summary.active;
-            
-            document.getElementById('reportSummary').style.display = 'grid';
-            document.getElementById('reportTableContainer').style.display = 'block';
-
-            // Populate table
-            const tbody = document.getElementById('reportTableBody');
-            
-            if (members.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="8" style="text-align: center;">No members found for selected criteria</td></tr>';
-                return;
-            }
-
-            tbody.innerHTML = members.map(member => `
-                <tr>
-                    <td>#MEM-${String(member.id).padStart(3, '0')}</td>
-                    <td>${member.fullname}</td>
-                    <td>${member.email}</td>
-                    <td>${member.mobile_number || 'N/A'}</td>
-                    <td>${member.sex}</td>
-                    <td>${formatDate(member.birthday)}</td>
-                    <td>${formatDate(member.created_at)}</td>
-                    <td><span style="color: ${member.is_active ? 'var(--success)' : 'var(--warning)'};">●</span> ${member.is_active ? 'Active' : 'Inactive'}</td>
-                </tr>
-            `).join('');
-
-            showMessage('success', `Report generated successfully! Found ${members.length} member(s)`);
-        }
-
-        function exportToPDF() {
-            if (reportData.length === 0) {
-                showMessage('error', 'Please generate a report first before exporting');
-                return;
-            }
-
-            const { jsPDF } = window.jspdf;
-            const doc = new jsPDF();
-
-            // Add title
-            doc.setFontSize(20);
-            doc.setTextColor(231, 76, 60);
-            doc.text('Catague Fitness Gym', 105, 20, { align: 'center' });
-            
-            doc.setFontSize(14);
-            doc.setTextColor(0, 0, 0);
-            doc.text('New Member Registration Report', 105, 30, { align: 'center' });
-
-            // Add report details
-            doc.setFontSize(10);
-            const startDate = document.getElementById('startDate').value;
-            const endDate = document.getElementById('endDate').value;
-            doc.text(`Report Period: ${startDate} to ${endDate}`, 14, 40);
-            doc.text(`Generated: ${new Date().toLocaleString()}`, 14, 46);
-
-            // Add summary
-            doc.setFontSize(12);
-            doc.setTextColor(231, 76, 60);
-            doc.text('Summary', 14, 56);
-            
-            doc.setFontSize(10);
-            doc.setTextColor(0, 0, 0);
-            doc.text(`Total Members: ${document.getElementById('reportTotal').textContent}`, 14, 64);
-            doc.text(`Male: ${document.getElementById('reportMale').textContent}`, 70, 64);
-            doc.text(`Female: ${document.getElementById('reportFemale').textContent}`, 110, 64);
-            doc.text(`Active: ${document.getElementById('reportActive').textContent}`, 150, 64);
-
-            // Prepare table data
-            const tableData = reportData.map(member => [
-                `#MEM-${String(member.id).padStart(3, '0')}`,
-                member.fullname,
-                member.email,
-                member.mobile_number || 'N/A',
-                member.sex,
-                formatDate(member.birthday),
-                formatDate(member.created_at),
-                member.is_active ? 'Active' : 'Inactive'
-            ]);
-
-            // Add table
-            doc.autoTable({
-                startY: 72,
-                head: [['ID', 'Name', 'Email', 'Phone', 'Gender', 'Birthday', 'Reg. Date', 'Status']],
-                body: tableData,
-                theme: 'grid',
-                headStyles: { 
-                    fillColor: [231, 76, 60],
-                    textColor: [255, 255, 255],
-                    fontStyle: 'bold'
-                },
-                styles: {
-                    fontSize: 8,
-                    cellPadding: 3
-                },
-                alternateRowStyles: {
-                    fillColor: [245, 245, 245]
-                }
-            });
-
-            // Save PDF
-            const filename = `new_members_report_${startDate}_to_${endDate}.pdf`;
-            doc.save(filename);
-            
-            showMessage('success', 'Report exported to PDF successfully!');
-        }
-
-        function loadMembers() {
-            fetch('api_members.php?action=get_all')
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        allMembers = data.data;
-                        displayMembers(allMembers);
-                    }
-                })
-                .catch(error => console.error('Error:', error));
-        }
-
-        function displayMembers(members) {
-            const tbody = document.getElementById('membersTableBody');
-
-            if (members.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="8" style="text-align: center;">No members found</td></tr>';
-                return;
-            }
-
-            tbody.innerHTML = members.map(member => `
-            <tr data-id="${member.id}">
-                <td>#MEM-${String(member.id).padStart(3, '0')}</td>
-                <td>${member.fullname}</td>
-                <td>${member.email}</td>
-                <td>${member.mobile_number || 'N/A'}</td>
-                <td>${formatDate(member.birthday)}</td>
-                <td>${formatDate(member.created_at)}</td>
-                <td><span style="color: ${member.is_active ? 'var(--success)' : 'var(--warning)'};">●</span> ${member.is_active ? 'Active' : 'Inactive'}</td>
-                <td>
-                    <div class="action-buttons">
-                        <button class="btn-small" onclick="toggleStatus(${member.id}, ${member.is_active})">${member.is_active ? 'Deactivate' : 'Activate'}</button>
-                        <button class="btn-small delete" onclick="deleteMember(${member.id})">Delete</button>
-                    </div>
-                </td>
-            </tr>
-        `).join('');
-        }
-
-        function formatDate(dateString) {
-            const date = new Date(dateString);
-            return date.toLocaleDateString('en-US', {
-                year: 'numeric',
-                month: 'short',
-                day: 'numeric'
-            });
-        }
-
-        document.getElementById('registerForm').addEventListener('submit', function(e) {
-            e.preventDefault();
-
-            const formData = new FormData(this);
-            formData.append('action', 'register');
-
-            fetch('api_members.php', {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        showMessage('success', data.message);
-                        this.reset();
-                        setTimeout(() => {
-                            showPage('manage');
-                        }, 1500);
-                    } else {
-                        showMessage('error', data.message);
-                    }
-                })
-                .catch(error => {
-                    console.error('Error:', error);
-                    showMessage('error', 'An error occurred while registering member');
-                });
-        });
-
-        function toggleStatus(id, currentStatus) {
-            const formData = new FormData();
-            formData.append('action', 'toggle_status');
-            formData.append('id', id);
-            formData.append('status', currentStatus ? 0 : 1);
-
-            fetch('api_members.php', {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        showMessage('success', data.message);
-                        loadMembers();
-                        location.reload();
-                    } else {
-                        showMessage('error', data.message);
-                    }
-                })
-                .catch(error => {
-                    console.error('Error:', error);
-                    showMessage('error', 'An error occurred');
-                });
-        }
-
-        function deleteMember(id) {
-            if (!confirm('Are you sure you want to delete this member?')) {
-                return;
-            }
-
-            const formData = new FormData();
-            formData.append('action', 'delete');
-            formData.append('id', id);
-
-            fetch('api_members.php', {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        showMessage('success', data.message);
-                        loadMembers();
-                        location.reload();
-                    } else {
-                        showMessage('error', data.message);
-                    }
-                })
-                .catch(error => {
-                    console.error('Error:', error);
-                    showMessage('error', 'An error occurred while deleting member');
-                });
-        }
-
-        document.getElementById('searchBox').addEventListener('input', function(e) {
-            const searchTerm = e.target.value.toLowerCase();
-            const filteredMembers = allMembers.filter(member =>
-                member.fullname.toLowerCase().includes(searchTerm) ||
-                member.email.toLowerCase().includes(searchTerm) ||
-                (member.username && member.username.toLowerCase().includes(searchTerm))
-            );
-            displayMembers(filteredMembers);
-        });
-
-        function showMessage(type, message) {
-            const messageBox = document.createElement('div');
-            messageBox.className = `message-box ${type}`;
-            messageBox.innerHTML = `
-            <i class="fas fa-${type === 'success' ? 'check-circle' : 'exclamation-circle'}"></i>
-            <span>${message}</span>
-        `;
-
-            const mainContent = document.querySelector('.main-content');
-            const header = mainContent.querySelector('.header');
-            mainContent.insertBefore(messageBox, header.nextSibling);
-
-            setTimeout(() => {
-                messageBox.style.opacity = '0';
-                messageBox.style.transform = 'translateY(-10px)';
-                setTimeout(() => messageBox.remove(), 300);
-            }, 3000);
         }
 
         function logout() {
@@ -696,59 +314,56 @@ for ($month = 1; $month <= 10; $month++) {
             }
         }
 
-        // Initialize chart and load members on page load
-        window.addEventListener('DOMContentLoaded', function() {
-            // Set default dates for report (current month)
-            const today = new Date();
-            const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
-            const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+        function showMessage(type, message) {
+            const container = document.getElementById('message-container');
+            const messageBox = document.createElement('div');
+            messageBox.className = `message-box ${type}`;
+            messageBox.innerHTML = `
+                <i class="fas fa-${type === 'success' ? 'check-circle' : 'exclamation-circle'}"></i>
+                <span>${message}</span>
+            `;
             
-            document.getElementById('startDate').valueAsDate = firstDay;
-            document.getElementById('endDate').valueAsDate = lastDay;
+            container.innerHTML = '';
+            container.appendChild(messageBox);
+            
+            setTimeout(() => {
+                messageBox.style.opacity = '0';
+                setTimeout(() => messageBox.remove(), 300);
+            }, 3000);
+        }
 
-            // Initialize the chart
+        // Initialize chart
+        window.addEventListener('DOMContentLoaded', function() {
             const chartLabels = <?php echo json_encode($chartLabels); ?>;
-            const chartData = <?php echo json_encode($chartData); ?>;
+            const presentData = <?php echo json_encode($presentData); ?>;
+            const absentData = <?php echo json_encode($absentData); ?>;
 
-            // Calculate statistics
-            const totalNew = chartData.reduce((a, b) => parseInt(a) + parseInt(b), 0);
-            const avgNew = chartData.length > 0 ? (totalNew / chartData.length).toFixed(1) : 0;
-            const maxValue = Math.max(...chartData);
-            const peakMonthIndex = chartData.indexOf(maxValue);
-            const peakMonth = maxValue > 0 ? chartLabels[peakMonthIndex] : 'N/A';
+            const ctx = document.getElementById('attendanceChart').getContext('2d');
 
-            // Update statistics display
-            document.getElementById('totalNewMembers').textContent = totalNew;
-            document.getElementById('avgPerMonth').textContent = avgNew;
-            document.getElementById('peakMonth').textContent = peakMonth;
-
-            const ctx = document.getElementById('memberChart').getContext('2d');
-
-            // Create gradient
-            const gradient = ctx.createLinearGradient(0, 0, 0, 400);
-            gradient.addColorStop(0, 'rgba(231, 76, 60, 0.4)');
-            gradient.addColorStop(1, 'rgba(231, 76, 60, 0.05)');
-
-            const memberChart = new Chart(ctx, {
+            new Chart(ctx, {
                 type: 'line',
                 data: {
                     labels: chartLabels,
                     datasets: [{
-                        label: 'New Members',
-                        data: chartData,
-                        backgroundColor: gradient,
-                        borderColor: '#e74c3c',
+                        label: 'Present',
+                        data: presentData,
+                        backgroundColor: 'rgba(0, 255, 136, 0.2)',
+                        borderColor: '#00FF88',
                         borderWidth: 3,
                         fill: true,
                         tension: 0.4,
-                        pointBackgroundColor: '#e74c3c',
-                        pointBorderColor: '#ffffff',
-                        pointBorderWidth: 3,
-                        pointRadius: 6,
-                        pointHoverRadius: 9,
-                        pointHoverBackgroundColor: '#e74c3c',
-                        pointHoverBorderColor: '#ffffff',
-                        pointHoverBorderWidth: 3
+                        pointRadius: 5,
+                        pointBackgroundColor: '#00FF88'
+                    }, {
+                        label: 'Absent',
+                        data: absentData,
+                        backgroundColor: 'rgba(255, 71, 87, 0.2)',
+                        borderColor: '#FF4757',
+                        borderWidth: 3,
+                        fill: true,
+                        tension: 0.4,
+                        pointRadius: 5,
+                        pointBackgroundColor: '#FF4757'
                     }]
                 },
                 options: {
@@ -756,27 +371,11 @@ for ($month = 1; $month <= 10; $month++) {
                     maintainAspectRatio: true,
                     plugins: {
                         legend: {
-                            display: false
-                        },
-                        tooltip: {
-                            backgroundColor: 'rgba(26, 26, 46, 0.95)',
-                            titleColor: '#ffffff',
-                            bodyColor: '#ffffff',
-                            padding: 15,
-                            cornerRadius: 10,
-                            titleFont: {
-                                size: 15,
-                                weight: 'bold'
-                            },
-                            bodyFont: {
-                                size: 14
-                            },
-                            borderColor: 'rgba(231, 76, 60, 0.5)',
-                            borderWidth: 1,
-                            displayColors: false,
-                            callbacks: {
-                                label: function(context) {
-                                    return 'New Members: ' + context.parsed.y;
+                            display: true,
+                            labels: {
+                                color: '#E0E0E0',
+                                font: {
+                                    size: 13
                                 }
                             }
                         }
@@ -786,48 +385,24 @@ for ($month = 1; $month <= 10; $month++) {
                             beginAtZero: true,
                             ticks: {
                                 stepSize: 1,
-                                font: {
-                                    size: 13,
-                                    weight: '500'
-                                },
-                                color: 'rgba(255, 255, 255, 0.8)',
-                                padding: 10
+                                color: 'rgba(255, 255, 255, 0.8)'
                             },
                             grid: {
-                                color: 'rgba(255, 255, 255, 0.08)',
-                                drawBorder: false
-                            },
-                            border: {
-                                display: false
+                                color: 'rgba(255, 255, 255, 0.1)'
                             }
                         },
                         x: {
                             ticks: {
-                                font: {
-                                    size: 13,
-                                    weight: '500'
-                                },
-                                color: 'rgba(255, 255, 255, 0.8)',
-                                padding: 10
+                                color: 'rgba(255, 255, 255, 0.8)'
                             },
                             grid: {
                                 display: false
-                            },
-                            border: {
-                                display: false
                             }
                         }
-                    },
-                    interaction: {
-                        intersect: false,
-                        mode: 'index'
                     }
                 }
             });
-
-            loadMembers();
         });
     </script>
 </body>
-
 </html>
