@@ -1,4 +1,7 @@
 <?php
+// Prevent any output before JSON response
+ob_start();
+
 require_once 'config.php';
 requireLogin();
 
@@ -6,7 +9,25 @@ $conn = getDBConnection();
 
 // Handle AJAX requests
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
+    // Clear any output buffers to ensure clean JSON response
+    ob_clean();
+    
     $action = $_POST['action'] ?? '';
+    
+    if ($action === 'get_courses') {
+        $department_id = (int)$_POST['department_id'];
+        $stmt = $conn->prepare("SELECT id, code, name FROM courses WHERE department_id = ? AND is_active = 1 ORDER BY name");
+        $stmt->bind_param("i", $department_id);
+        $stmt->execute();
+        $result = $stmt->get_result();
+
+        $courses = [];
+        while ($row = $result->fetch_assoc()) {
+            $courses[] = $row;
+        }
+        jsonResponse(true, 'Courses found', $courses);
+        exit;
+    }
     
     if ($action === 'get_students') {
         $department_id = (int)$_POST['department_id'];
@@ -44,24 +65,48 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
         }
         
         jsonResponse(true, 'Students loaded', $students);
+        exit;
     }
     
     if ($action === 'save_attendance') {
-        $attendance_date = sanitizeInput($_POST['attendance_date']);
-        $attendanceData = json_decode($_POST['attendance_data'], true);
-        
-        if (empty($attendanceData)) {
-            jsonResponse(false, 'No attendance data provided');
-        }
-        
-        $conn->begin_transaction();
-        
         try {
+            $attendance_date = sanitizeInput($_POST['attendance_date']);
+            $attendanceData = json_decode($_POST['attendance_data'], true);
+            
+            if (empty($attendanceData)) {
+                jsonResponse(false, 'No attendance data provided');
+                exit;
+            }
+            
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                jsonResponse(false, 'Invalid attendance data format');
+                exit;
+            }
+            
+            $conn->begin_transaction();
+            
+            $success_count = 0;
+            
             foreach ($attendanceData as $record) {
                 $student_id = (int)$record['student_id'];
                 $status = sanitizeInput($record['status']);
                 $time_in = sanitizeInput($record['time_in']);
                 $remarks = sanitizeInput($record['remarks'] ?? '');
+                
+                // Validate status
+                if (!in_array($status, ['Present', 'Late', 'Absent'])) {
+                    continue;
+                }
+                
+                // If absent, clear time_in
+                if ($status === 'Absent') {
+                    $time_in = null;
+                } elseif (empty($time_in)) {
+                    $time_in = date('H:i:s');
+                } else {
+                    // Ensure time format is correct
+                    $time_in = date('H:i:s', strtotime($time_in));
+                }
                 
                 // Check if attendance already exists
                 $checkStmt = $conn->prepare("SELECT id FROM attendance WHERE student_id = ? AND attendance_date = ?");
@@ -71,25 +116,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
                 
                 if ($existing) {
                     // Update existing record
-                    $stmt = $conn->prepare("UPDATE attendance SET status = ?, time_in = ?, remarks = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
-                    $stmt->bind_param("sssi", $status, $time_in, $remarks, $existing['id']);
+                    if ($time_in !== null) {
+                        $stmt = $conn->prepare("UPDATE attendance SET status = ?, time_in = ?, remarks = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+                        $stmt->bind_param("sssi", $status, $time_in, $remarks, $existing['id']);
+                    } else {
+                        $stmt = $conn->prepare("UPDATE attendance SET status = ?, time_in = NULL, remarks = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+                        $stmt->bind_param("ssi", $status, $remarks, $existing['id']);
+                    }
                 } else {
                     // Insert new record
-                    $stmt = $conn->prepare("INSERT INTO attendance (student_id, attendance_date, status, time_in, remarks) VALUES (?, ?, ?, ?, ?)");
-                    $stmt->bind_param("issss", $student_id, $attendance_date, $status, $time_in, $remarks);
+                    if ($time_in !== null) {
+                        $stmt = $conn->prepare("INSERT INTO attendance (student_id, attendance_date, status, time_in, remarks) VALUES (?, ?, ?, ?, ?)");
+                        $stmt->bind_param("issss", $student_id, $attendance_date, $status, $time_in, $remarks);
+                    } else {
+                        $stmt = $conn->prepare("INSERT INTO attendance (student_id, attendance_date, status, time_in, remarks) VALUES (?, ?, ?, NULL, ?)");
+                        $stmt->bind_param("isss", $student_id, $attendance_date, $status, $remarks);
+                    }
                 }
                 
-                $stmt->execute();
+                if ($stmt->execute()) {
+                    $success_count++;
+                }
             }
             
             $conn->commit();
-            jsonResponse(true, 'Attendance saved successfully');
+            jsonResponse(true, "Attendance saved successfully ({$success_count} records)");
+            exit;
             
         } catch (Exception $e) {
             $conn->rollback();
-            jsonResponse(false, 'Failed to save attendance: ' . $e->getMessage());
+            error_log("Attendance save error: " . $e->getMessage());
+            jsonResponse(false, 'Failed to save attendance. Please try again.');
+            exit;
         }
     }
+    
+    // If action not recognized
+    jsonResponse(false, 'Invalid action');
+    exit;
 }
 
 // Get departments for dropdown
@@ -228,6 +292,12 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
         .btn-save-all:hover {
             transform: translateY(-2px);
             box-shadow: 0 10px 25px rgba(0, 208, 132, 0.3);
+        }
+
+        .btn-save-all:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
         }
 
         .attendance-table {
@@ -546,6 +616,7 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
 
     <script>
         let studentsData = [];
+        let isSaving = false;
 
         function logout() {
             if (confirm('Are you sure you want to logout?')) {
@@ -589,7 +660,7 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
             formData.append('action', 'get_courses');
             formData.append('department_id', departmentId);
             
-            fetch('students.php', {
+            fetch('attendance.php', {
                 method: 'POST',
                 body: formData
             })
@@ -790,13 +861,19 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
         }
 
         function saveAllAttendance() {
+            if (isSaving) {
+                return;
+            }
+
             const attendance_date = document.getElementById('attendance_date').value;
             const attendanceData = [];
 
             studentsData.forEach(student => {
                 const row = document.querySelector(`tr[data-student-id="${student.id}"]`);
+                if (!row) return;
+
                 const statusBtn = row.querySelector('.btn-status.active');
-                const status = statusBtn ? statusBtn.textContent.trim().split(' ')[1] : 'Present';
+                const status = statusBtn ? statusBtn.textContent.trim().replace(/\s+/g, ' ').split(' ').pop() : 'Present';
                 const timeInput = row.querySelector('.time-input');
                 const time_in = timeInput.disabled ? '' : timeInput.value;
                 const remarks = row.querySelector('.remarks-input').value;
@@ -814,6 +891,12 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
                 return;
             }
 
+            isSaving = true;
+            const saveBtn = document.querySelector('.btn-save-all');
+            const originalContent = saveBtn.innerHTML;
+            saveBtn.disabled = true;
+            saveBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
+
             const formData = new FormData();
             formData.append('ajax', '1');
             formData.append('action', 'save_attendance');
@@ -828,13 +911,17 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
             .then(data => {
                 showMessage(data.success ? 'success' : 'error', data.message);
                 if (data.success) {
-                    // Reload students to show updated data
                     setTimeout(() => loadStudents(), 1500);
                 }
             })
             .catch(error => {
                 console.error('Error:', error);
                 showMessage('error', 'Failed to save attendance');
+            })
+            .finally(() => {
+                isSaving = false;
+                saveBtn.disabled = false;
+                saveBtn.innerHTML = originalContent;
             });
         }
     </script>
