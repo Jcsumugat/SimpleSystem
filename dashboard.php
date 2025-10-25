@@ -9,7 +9,8 @@ $user_id = $_SESSION['user_id'];
 $userQuery = $conn->prepare("SELECT fullname, email, role FROM users WHERE id = ?");
 $userQuery->bind_param("i", $user_id);
 $userQuery->execute();
-$user = $userQuery->fetch_assoc();
+$result = $userQuery->get_result();
+$user = $result->fetch_assoc();
 
 // Get statistics
 $totalStudents = $conn->query("SELECT COUNT(*) as total FROM students WHERE is_active = 1")->fetch_assoc()['total'];
@@ -27,8 +28,8 @@ $monthAttendance = $conn->query("SELECT
     FROM attendance 
     WHERE DATE_FORMAT(attendance_date, '%Y-%m') = '$currentMonth'")->fetch_assoc();
 
-$attendanceRate = $monthAttendance['total_count'] > 0 
-    ? round(($monthAttendance['present_count'] / $monthAttendance['total_count']) * 100, 1) 
+$attendanceRate = $monthAttendance['total_count'] > 0
+    ? round(($monthAttendance['present_count'] / $monthAttendance['total_count']) * 100, 1)
     : 0;
 
 // Get recent attendance (last 7 days)
@@ -70,6 +71,7 @@ $conn->close();
 ?>
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -79,6 +81,7 @@ $conn->close();
     <link rel="stylesheet" href="dashboard.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
 </head>
+
 <body>
     <div class="dashboard-container">
         <aside class="sidebar">
@@ -92,19 +95,19 @@ $conn->close();
                     <i class="fas fa-chart-line"></i>
                     <span>Dashboard</span>
                 </div>
-                <div class="nav-item" onclick="showPage('students')">
+                <div class="nav-item" onclick="location.href='students.php'">
                     <i class="fas fa-users"></i>
                     <span>Students</span>
                 </div>
-                <div class="nav-item" onclick="showPage('attendance')">
+                <div class="nav-item" onclick="location.href='attendance.php'">
                     <i class="fas fa-clipboard-check"></i>
                     <span>Mark Attendance</span>
                 </div>
-                <div class="nav-item" onclick="showPage('records')">
+                <div class="nav-item" onclick="location.href='records.php'">
                     <i class="fas fa-history"></i>
                     <span>Attendance Records</span>
                 </div>
-                <div class="nav-item" onclick="showPage('reports')">
+                <div class="nav-item" onclick="location.href='reports.php'">
                     <i class="fas fa-file-alt"></i>
                     <span>Reports</span>
                 </div>
@@ -300,10 +303,6 @@ $conn->close();
 
             const titles = {
                 'dashboard': 'Dashboard',
-                'students': 'Students Management',
-                'attendance': 'Mark Attendance',
-                'records': 'Attendance Records',
-                'reports': 'Reports'
             };
             document.getElementById('page-title').textContent = titles[pageName];
         }
@@ -322,10 +321,10 @@ $conn->close();
                 <i class="fas fa-${type === 'success' ? 'check-circle' : 'exclamation-circle'}"></i>
                 <span>${message}</span>
             `;
-            
+
             container.innerHTML = '';
             container.appendChild(messageBox);
-            
+
             setTimeout(() => {
                 messageBox.style.opacity = '0';
                 setTimeout(() => messageBox.remove(), 300);
@@ -405,4 +404,5 @@ $conn->close();
         });
     </script>
 </body>
+
 </html>
