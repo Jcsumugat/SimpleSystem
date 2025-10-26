@@ -7,13 +7,48 @@ requireLogin();
 
 $conn = getDBConnection();
 
+// Handle file upload for excuse letters
+function handleExcuseUpload($file, $student_id, $attendance_date)
+{
+    $upload_dir = 'uploads/excuse_letters/';
+
+    // Create directory if it doesn't exist
+    if (!file_exists($upload_dir)) {
+        mkdir($upload_dir, 0755, true);
+    }
+
+    // Validate file
+    $allowed_types = ['image/jpeg', 'image/png', 'image/jpg', 'application/pdf'];
+    $max_size = 5 * 1024 * 1024; // 5MB
+
+    if (!in_array($file['type'], $allowed_types)) {
+        return ['success' => false, 'message' => 'Invalid file type. Only JPG, PNG, and PDF are allowed.'];
+    }
+
+    if ($file['size'] > $max_size) {
+        return ['success' => false, 'message' => 'File too large. Maximum size is 5MB.'];
+    }
+
+    // Generate unique filename
+    $extension = pathinfo($file['name'], PATHINFO_EXTENSION);
+    $filename = 'excuse_' . $student_id . '_' . date('Ymd_His', strtotime($attendance_date)) . '_' . uniqid() . '.' . $extension;
+    $filepath = $upload_dir . $filename;
+
+    // Move uploaded file
+    if (move_uploaded_file($file['tmp_name'], $filepath)) {
+        return ['success' => true, 'filepath' => $filepath];
+    }
+
+    return ['success' => false, 'message' => 'Failed to upload file.'];
+}
+
 // Handle AJAX requests
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
     // Clear any output buffers to ensure clean JSON response
     ob_clean();
-    
+
     $action = $_POST['action'] ?? '';
-    
+
     if ($action === 'get_courses') {
         $department_id = (int)$_POST['department_id'];
         $stmt = $conn->prepare("SELECT id, code, name FROM courses WHERE department_id = ? AND is_active = 1 ORDER BY name");
@@ -28,14 +63,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
         jsonResponse(true, 'Courses found', $courses);
         exit;
     }
-    
+
     if ($action === 'get_students') {
         $department_id = (int)$_POST['department_id'];
         $course_id = (int)$_POST['course_id'];
         $year_level = sanitizeInput($_POST['year_level']);
         $section_id = (int)$_POST['section_id'];
         $attendance_date = sanitizeInput($_POST['attendance_date']);
-        
+
         $query = "SELECT 
             s.id,
             s.student_id,
@@ -44,7 +79,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
             a.id as attendance_id,
             a.status,
             a.time_in,
-            a.remarks
+            a.remarks,
+            a.excuse_file
             FROM students s
             LEFT JOIN attendance a ON s.id = a.student_id AND a.attendance_date = ?
             WHERE s.is_active = 1 
@@ -53,51 +89,52 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
             AND s.year_level = ?
             AND s.section_id = ?
             ORDER BY s.lastname, s.firstname";
-        
+
         $stmt = $conn->prepare($query);
         $stmt->bind_param("siisi", $attendance_date, $department_id, $course_id, $year_level, $section_id);
         $stmt->execute();
         $result = $stmt->get_result();
-        
+
         $students = [];
         while ($row = $result->fetch_assoc()) {
             $students[] = $row;
         }
-        
+
         jsonResponse(true, 'Students loaded', $students);
         exit;
     }
-    
+
     if ($action === 'save_attendance') {
         try {
             $attendance_date = sanitizeInput($_POST['attendance_date']);
             $attendanceData = json_decode($_POST['attendance_data'], true);
-            
+
             if (empty($attendanceData)) {
                 jsonResponse(false, 'No attendance data provided');
                 exit;
             }
-            
+
             if (json_last_error() !== JSON_ERROR_NONE) {
                 jsonResponse(false, 'Invalid attendance data format');
                 exit;
             }
-            
+
             $conn->begin_transaction();
-            
+
             $success_count = 0;
-            
+
             foreach ($attendanceData as $record) {
                 $student_id = (int)$record['student_id'];
                 $status = sanitizeInput($record['status']);
                 $time_in = sanitizeInput($record['time_in']);
                 $remarks = sanitizeInput($record['remarks'] ?? '');
-                
+                $excuse_file = $record['excuse_file'] ?? null;
+
                 // Validate status
-                if (!in_array($status, ['Present', 'Late', 'Absent'])) {
+                if (!in_array($status, ['Present', 'Late', 'Absent', 'Excused'])) {
                     continue;
                 }
-                
+
                 // If absent, clear time_in
                 if ($status === 'Absent') {
                     $time_in = null;
@@ -107,42 +144,66 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
                     // Ensure time format is correct
                     $time_in = date('H:i:s', strtotime($time_in));
                 }
-                
+
                 // Check if attendance already exists
-                $checkStmt = $conn->prepare("SELECT id FROM attendance WHERE student_id = ? AND attendance_date = ?");
+                $checkStmt = $conn->prepare("SELECT id, excuse_file FROM attendance WHERE student_id = ? AND attendance_date = ?");
                 $checkStmt->bind_param("is", $student_id, $attendance_date);
                 $checkStmt->execute();
                 $existing = $checkStmt->get_result()->fetch_assoc();
-                
+
                 if ($existing) {
                     // Update existing record
-                    if ($time_in !== null) {
-                        $stmt = $conn->prepare("UPDATE attendance SET status = ?, time_in = ?, remarks = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
-                        $stmt->bind_param("sssi", $status, $time_in, $remarks, $existing['id']);
+                    if ($excuse_file) {
+                        // Delete old file if exists and new file is uploaded
+                        if ($existing['excuse_file'] && file_exists($existing['excuse_file'])) {
+                            unlink($existing['excuse_file']);
+                        }
+
+                        if ($time_in !== null) {
+                            $stmt = $conn->prepare("UPDATE attendance SET status = ?, time_in = ?, remarks = ?, excuse_file = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+                            $stmt->bind_param("ssssi", $status, $time_in, $remarks, $excuse_file, $existing['id']);
+                        } else {
+                            $stmt = $conn->prepare("UPDATE attendance SET status = ?, time_in = NULL, remarks = ?, excuse_file = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+                            $stmt->bind_param("sssi", $status, $remarks, $excuse_file, $existing['id']);
+                        }
                     } else {
-                        $stmt = $conn->prepare("UPDATE attendance SET status = ?, time_in = NULL, remarks = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
-                        $stmt->bind_param("ssi", $status, $remarks, $existing['id']);
+                        if ($time_in !== null) {
+                            $stmt = $conn->prepare("UPDATE attendance SET status = ?, time_in = ?, remarks = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+                            $stmt->bind_param("sssi", $status, $time_in, $remarks, $existing['id']);
+                        } else {
+                            $stmt = $conn->prepare("UPDATE attendance SET status = ?, time_in = NULL, remarks = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+                            $stmt->bind_param("ssi", $status, $remarks, $existing['id']);
+                        }
                     }
                 } else {
                     // Insert new record
-                    if ($time_in !== null) {
-                        $stmt = $conn->prepare("INSERT INTO attendance (student_id, attendance_date, status, time_in, remarks) VALUES (?, ?, ?, ?, ?)");
-                        $stmt->bind_param("issss", $student_id, $attendance_date, $status, $time_in, $remarks);
+                    if ($excuse_file) {
+                        if ($time_in !== null) {
+                            $stmt = $conn->prepare("INSERT INTO attendance (student_id, attendance_date, status, time_in, remarks, excuse_file) VALUES (?, ?, ?, ?, ?, ?)");
+                            $stmt->bind_param("isssss", $student_id, $attendance_date, $status, $time_in, $remarks, $excuse_file);
+                        } else {
+                            $stmt = $conn->prepare("INSERT INTO attendance (student_id, attendance_date, status, time_in, remarks, excuse_file) VALUES (?, ?, ?, NULL, ?, ?)");
+                            $stmt->bind_param("issss", $student_id, $attendance_date, $status, $remarks, $excuse_file);
+                        }
                     } else {
-                        $stmt = $conn->prepare("INSERT INTO attendance (student_id, attendance_date, status, time_in, remarks) VALUES (?, ?, ?, NULL, ?)");
-                        $stmt->bind_param("isss", $student_id, $attendance_date, $status, $remarks);
+                        if ($time_in !== null) {
+                            $stmt = $conn->prepare("INSERT INTO attendance (student_id, attendance_date, status, time_in, remarks) VALUES (?, ?, ?, ?, ?)");
+                            $stmt->bind_param("issss", $student_id, $attendance_date, $status, $time_in, $remarks);
+                        } else {
+                            $stmt = $conn->prepare("INSERT INTO attendance (student_id, attendance_date, status, time_in, remarks) VALUES (?, ?, ?, NULL, ?)");
+                            $stmt->bind_param("isss", $student_id, $attendance_date, $status, $remarks);
+                        }
                     }
                 }
-                
+
                 if ($stmt->execute()) {
                     $success_count++;
                 }
             }
-            
+
             $conn->commit();
             jsonResponse(true, "Attendance saved successfully ({$success_count} records)");
             exit;
-            
         } catch (Exception $e) {
             $conn->rollback();
             error_log("Attendance save error: " . $e->getMessage());
@@ -150,7 +211,57 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
             exit;
         }
     }
-    
+
+    if ($action === 'upload_excuse') {
+        $student_id = (int)$_POST['student_id'];
+        $attendance_date = sanitizeInput($_POST['attendance_date']);
+
+        if (!isset($_FILES['excuse_file']) || $_FILES['excuse_file']['error'] !== UPLOAD_ERR_OK) {
+            jsonResponse(false, 'Please select a valid file');
+            exit;
+        }
+
+        $upload_result = handleExcuseUpload($_FILES['excuse_file'], $student_id, $attendance_date);
+
+        if ($upload_result['success']) {
+            jsonResponse(true, 'File uploaded successfully', ['filepath' => $upload_result['filepath']]);
+        } else {
+            jsonResponse(false, $upload_result['message']);
+        }
+        exit;
+    }
+
+    if ($action === 'delete_excuse') {
+        $student_id = (int)$_POST['student_id'];
+        $attendance_date = sanitizeInput($_POST['attendance_date']);
+
+        // Get the file path
+        $stmt = $conn->prepare("SELECT excuse_file FROM attendance WHERE student_id = ? AND attendance_date = ?");
+        $stmt->bind_param("is", $student_id, $attendance_date);
+        $stmt->execute();
+        $result = $stmt->get_result()->fetch_assoc();
+
+        if ($result && $result['excuse_file']) {
+            // Delete the file
+            if (file_exists($result['excuse_file'])) {
+                unlink($result['excuse_file']);
+            }
+
+            // Update database
+            $updateStmt = $conn->prepare("UPDATE attendance SET excuse_file = NULL WHERE student_id = ? AND attendance_date = ?");
+            $updateStmt->bind_param("is", $student_id, $attendance_date);
+
+            if ($updateStmt->execute()) {
+                jsonResponse(true, 'Excuse letter removed successfully');
+            } else {
+                jsonResponse(false, 'Failed to remove excuse letter');
+            }
+        } else {
+            jsonResponse(false, 'No excuse letter found');
+        }
+        exit;
+    }
+
     // If action not recognized
     jsonResponse(false, 'Invalid action');
     exit;
@@ -164,6 +275,7 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
 ?>
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -328,16 +440,17 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
 
         .status-buttons {
             display: flex;
-            gap: 10px;
+            gap: 8px;
+            flex-wrap: wrap;
         }
 
         .btn-status {
-            padding: 8px 15px;
+            padding: 6px 12px;
             border: 2px solid;
             border-radius: 8px;
             cursor: pointer;
             font-weight: 600;
-            font-size: 0.85rem;
+            font-size: 0.8rem;
             transition: all 0.3s ease;
             background: transparent;
         }
@@ -372,6 +485,16 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
             color: white;
         }
 
+        .btn-status.excused {
+            border-color: #9B59B6;
+            color: #9B59B6;
+        }
+
+        .btn-status.excused.active {
+            background: #9B59B6;
+            color: white;
+        }
+
         .time-input {
             padding: 8px 12px;
             background: rgba(255, 255, 255, 0.05);
@@ -401,6 +524,67 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
             border-color: var(--accent-green);
         }
 
+        .excuse-upload-container {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .excuse-upload-btn {
+            padding: 8px 12px;
+            background: rgba(155, 89, 182, 0.2);
+            border: 2px solid #9B59B6;
+            border-radius: 8px;
+            color: #9B59B6;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            justify-content: center;
+        }
+
+        .excuse-upload-btn:hover {
+            background: rgba(155, 89, 182, 0.3);
+        }
+
+        .excuse-file-info {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: rgba(155, 89, 182, 0.1);
+            border-radius: 8px;
+            font-size: 0.85rem;
+        }
+
+        .excuse-file-info a {
+            color: #9B59B6;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .excuse-file-info a:hover {
+            text-decoration: underline;
+        }
+
+        .btn-remove-excuse {
+            padding: 4px 8px;
+            background: rgba(255, 71, 87, 0.2);
+            border: 1px solid var(--error);
+            border-radius: 6px;
+            color: var(--error);
+            cursor: pointer;
+            font-size: 0.75rem;
+            transition: all 0.3s ease;
+        }
+
+        .btn-remove-excuse:hover {
+            background: rgba(255, 71, 87, 0.3);
+        }
+
         .loading {
             text-align: center;
             padding: 40px;
@@ -413,8 +597,13 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
         }
 
         @keyframes spin {
-            from { transform: rotate(0deg); }
-            to { transform: rotate(360deg); }
+            from {
+                transform: rotate(0deg);
+            }
+
+            to {
+                transform: rotate(360deg);
+            }
         }
 
         .empty-state {
@@ -466,8 +655,196 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
         .btn-bulk:hover {
             transform: translateY(-2px);
         }
+
+        /* Modal Styles */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(5px);
+        }
+
+        .modal.active {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-content {
+            background: var(--card-bg);
+            border: 1px solid rgba(157, 78, 221, 0.3);
+            border-radius: 15px;
+            padding: 30px;
+            max-width: 500px;
+            width: 90%;
+            animation: slideIn 0.3s ease;
+        }
+
+        .excuse-upload-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            background: rgba(155, 89, 182, 0.1);
+        }
+
+        .excuse-upload-btn:disabled:hover::after {
+            content: 'Status must be "Excused" to upload';
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--error);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            white-space: nowrap;
+            margin-bottom: 5px;
+            z-index: 10;
+        }
+
+        .excuse-upload-btn:disabled:hover::before {
+            content: '';
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            border: 6px solid transparent;
+            border-top-color: var(--error);
+            margin-bottom: -6px;
+        }
+
+        .excuse-upload-container {
+            position: relative;
+        }
+
+        .excuse-file-info.disabled {
+            opacity: 0.5;
+            pointer-events: none;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateY(-50px);
+                opacity: 0;
+            }
+
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid rgba(157, 78, 221, 0.2);
+        }
+
+        .modal-header h3 {
+            color: var(--text-light);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .btn-close-modal {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 1.5rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .btn-close-modal:hover {
+            color: var(--error);
+        }
+
+        .file-upload-area {
+            border: 2px dashed rgba(157, 78, 221, 0.3);
+            border-radius: 10px;
+            padding: 30px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-bottom: 20px;
+        }
+
+        .file-upload-area:hover {
+            border-color: #9B59B6;
+            background: rgba(155, 89, 182, 0.05);
+        }
+
+        .file-upload-area.dragover {
+            border-color: #9B59B6;
+            background: rgba(155, 89, 182, 0.1);
+        }
+
+        .file-upload-area i {
+            font-size: 3rem;
+            color: #9B59B6;
+            margin-bottom: 15px;
+        }
+
+        .file-upload-area p {
+            color: var(--text-secondary);
+            margin: 5px 0;
+        }
+
+        .selected-file {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 15px;
+            background: rgba(155, 89, 182, 0.1);
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .selected-file i {
+            font-size: 1.5rem;
+            color: #9B59B6;
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+
+        .btn-modal {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+
+        .btn-modal.cancel {
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-secondary);
+        }
+
+        .btn-modal.upload {
+            background: linear-gradient(135deg, #9B59B6, #8E44AD);
+            color: white;
+        }
+
+        .btn-modal:hover {
+            transform: translateY(-2px);
+        }
     </style>
 </head>
+
 <body>
     <div class="dashboard-container">
         <aside class="sidebar">
@@ -565,9 +942,9 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
                         <label>Section *</label>
                         <select id="section_id">
                             <option value="">Select Section</option>
-                            <?php 
+                            <?php
                             $sections->data_seek(0);
-                            while ($section = $sections->fetch_assoc()): 
+                            while ($section = $sections->fetch_assoc()):
                             ?>
                                 <option value="<?php echo $section['id']; ?>">
                                     <?php echo htmlspecialchars($section['name']); ?>
@@ -614,9 +991,40 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
         </main>
     </div>
 
+    <!-- Excuse Letter Upload Modal -->
+    <div id="excuseModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-file-upload"></i> Upload Excuse Letter</h3>
+                <button class="btn-close-modal" onclick="closeExcuseModal()">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+
+            <div class="file-upload-area" id="fileUploadArea" onclick="document.getElementById('excuseFileInput').click()">
+                <i class="fas fa-cloud-upload-alt"></i>
+                <p><strong>Click to upload</strong> or drag and drop</p>
+                <p style="font-size: 0.85rem;">JPG, PNG or PDF (Max 5MB)</p>
+            </div>
+
+            <input type="file" id="excuseFileInput" accept=".jpg,.jpeg,.png,.pdf" style="display: none;" onchange="handleFileSelect(this)">
+
+            <div id="selectedFileInfo" style="display: none;"></div>
+
+            <div class="modal-actions">
+                <button class="btn-modal cancel" onclick="closeExcuseModal()">Cancel</button>
+                <button class="btn-modal upload" id="uploadBtn" onclick="uploadExcuseLetter()" disabled>
+                    <i class="fas fa-upload"></i> Upload
+                </button>
+            </div>
+        </div>
+    </div>
+
     <script>
         let studentsData = [];
         let isSaving = false;
+        let currentUploadStudent = null;
+        let selectedFile = null;
 
         function logout() {
             if (confirm('Are you sure you want to logout?')) {
@@ -632,10 +1040,10 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
                 <i class="fas fa-${type === 'success' ? 'check-circle' : 'exclamation-circle'}"></i>
                 <span>${message}</span>
             `;
-            
+
             container.innerHTML = '';
             container.appendChild(messageBox);
-            
+
             setTimeout(() => {
                 messageBox.style.opacity = '0';
                 setTimeout(() => messageBox.remove(), 300);
@@ -645,43 +1053,43 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
         function loadCourses() {
             const departmentId = document.getElementById('department_id').value;
             const courseSelect = document.getElementById('course_id');
-            
+
             if (!departmentId) {
                 courseSelect.innerHTML = '<option value="">Select Department First</option>';
                 courseSelect.disabled = true;
                 return;
             }
-            
+
             courseSelect.disabled = false;
             courseSelect.innerHTML = '<option value="">Loading...</option>';
-            
+
             const formData = new FormData();
             formData.append('ajax', '1');
             formData.append('action', 'get_courses');
             formData.append('department_id', departmentId);
-            
+
             fetch('attendance.php', {
-                method: 'POST',
-                body: formData
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    courseSelect.innerHTML = '<option value="">Select Course</option>';
-                    data.data.forEach(course => {
-                        const option = document.createElement('option');
-                        option.value = course.id;
-                        option.textContent = `${course.code} - ${course.name}`;
-                        courseSelect.appendChild(option);
-                    });
-                } else {
-                    courseSelect.innerHTML = '<option value="">No courses found</option>';
-                }
-            })
-            .catch(error => {
-                console.error('Error:', error);
-                courseSelect.innerHTML = '<option value="">Error loading courses</option>';
-            });
+                    method: 'POST',
+                    body: formData
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        courseSelect.innerHTML = '<option value="">Select Course</option>';
+                        data.data.forEach(course => {
+                            const option = document.createElement('option');
+                            option.value = course.id;
+                            option.textContent = `${course.code} - ${course.name}`;
+                            courseSelect.appendChild(option);
+                        });
+                    } else {
+                        courseSelect.innerHTML = '<option value="">No courses found</option>';
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    courseSelect.innerHTML = '<option value="">Error loading courses</option>';
+                });
         }
 
         function loadStudents() {
@@ -698,7 +1106,7 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
 
             const container = document.getElementById('attendanceTableContainer');
             container.innerHTML = '<div class="loading"><i class="fas fa-spinner"></i><p>Loading students...</p></div>';
-            
+
             document.getElementById('attendanceSection').classList.add('active');
 
             const formData = new FormData();
@@ -711,69 +1119,70 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
             formData.append('section_id', section_id);
 
             fetch('attendance.php', {
-                method: 'POST',
-                body: formData
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    studentsData = data.data;
-                    
-                    if (studentsData.length === 0) {
-                        container.innerHTML = `
+                    method: 'POST',
+                    body: formData
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        studentsData = data.data;
+
+                        if (studentsData.length === 0) {
+                            container.innerHTML = `
                             <div class="empty-state">
                                 <i class="fas fa-users-slash"></i>
                                 <h3>No Students Found</h3>
                                 <p>No students found for the selected class</p>
                             </div>
                         `;
-                        return;
-                    }
+                            return;
+                        }
 
-                    renderAttendanceTable();
-                    
-                    const deptText = document.getElementById('department_id').selectedOptions[0].text.split(' - ')[0];
-                    const courseText = document.getElementById('course_id').selectedOptions[0].text.split(' - ')[0];
-                    document.getElementById('classInfo').textContent = 
-                        `${deptText} - ${courseText} - ${year_level} - Section ${document.getElementById('section_id').selectedOptions[0].text}`;
-                    
-                    showMessage('success', `Loaded ${studentsData.length} students`);
-                } else {
-                    container.innerHTML = `
+                        renderAttendanceTable();
+
+                        const deptText = document.getElementById('department_id').selectedOptions[0].text.split(' - ')[0];
+                        const courseText = document.getElementById('course_id').selectedOptions[0].text.split(' - ')[0];
+                        document.getElementById('classInfo').textContent =
+                            `${deptText} - ${courseText} - ${year_level} - Section ${document.getElementById('section_id').selectedOptions[0].text}`;
+
+                        showMessage('success', `Loaded ${studentsData.length} students`);
+                    } else {
+                        container.innerHTML = `
                         <div class="empty-state">
                             <i class="fas fa-exclamation-triangle"></i>
                             <h3>Error</h3>
                             <p>${data.message}</p>
                         </div>
                     `;
-                }
-            })
-            .catch(error => {
-                console.error('Error:', error);
-                container.innerHTML = `
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    container.innerHTML = `
                     <div class="empty-state">
                         <i class="fas fa-exclamation-triangle"></i>
                         <h3>Error</h3>
                         <p>Failed to load students</p>
                     </div>
                 `;
-            });
+                });
         }
 
         function renderAttendanceTable() {
             const container = document.getElementById('attendanceTableContainer');
             const currentTime = new Date().toTimeString().slice(0, 5);
-            
+
             let html = `
                 <table class="attendance-table">
                     <thead>
                         <tr>
-                            <th style="width: 5%">#</th>
-                            <th style="width: 12%">Student ID</th>
-                            <th style="width: 25%">Full Name</th>
-                            <th style="width: 20%">Status</th>
-                            <th style="width: 13%">Time In</th>
-                            <th style="width: 25%">Remarks</th>
+                            <th style="width: 4%">#</th>
+                            <th style="width: 10%">Student ID</th>
+                            <th style="width: 20%">Full Name</th>
+                            <th style="width: 25%">Status</th>
+                            <th style="width: 11%">Time In</th>
+                            <th style="width: 15%">Remarks</th>
+                            <th style="width: 15%">Excuse Letter</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -783,6 +1192,7 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
                 const status = student.status || 'Present';
                 const time_in = student.time_in || currentTime;
                 const remarks = student.remarks || '';
+                const excuse_file = student.excuse_file;
 
                 html += `
                     <tr data-student-id="${student.id}">
@@ -803,6 +1213,10 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
                                         onclick="setStatus(${student.id}, 'Absent')">
                                     <i class="fas fa-times"></i> Absent
                                 </button>
+                                <button class="btn-status excused ${status === 'Excused' ? 'active' : ''}" 
+                                        onclick="setStatus(${student.id}, 'Excused')">
+                                    <i class="fas fa-file-medical"></i> Excused
+                                </button>
                             </div>
                         </td>
                         <td>
@@ -816,6 +1230,34 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
                                    data-student-id="${student.id}"
                                    value="${remarks}"
                                    placeholder="Optional remarks...">
+                        </td>
+                        <td>
+                            <div class="excuse-upload-container" data-student-id="${student.id}">
+                `;
+
+                if (excuse_file) {
+                    const fileName = excuse_file.split('/').pop();
+                    const isDisabled = status !== 'Excused' ? 'disabled' : '';
+                    html += `
+                                <div class="excuse-file-info ${isDisabled}">
+                                    <i class="fas fa-file-alt"></i>
+                                    <a href="${excuse_file}" target="_blank">View File</a>
+                                    <button class="btn-remove-excuse" onclick="removeExcuse(${student.id})" ${isDisabled ? 'disabled' : ''}>
+                                        <i class="fas fa-trash"></i>
+                                    </button>
+                                </div>
+    `;
+                } else {
+                    const isDisabled = status !== 'Excused' ? 'disabled' : '';
+                    html += `
+                                <button class="excuse-upload-btn" onclick="openExcuseModal(${student.id})" ${isDisabled}>
+                                    <i class="fas fa-upload"></i> Upload Excuse
+                                </button>
+    `;
+                }
+
+                html += `
+                            </div>
                         </td>
                     </tr>
                 `;
@@ -851,6 +1293,22 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
             if (studentIndex !== -1) {
                 studentsData[studentIndex].status = status;
             }
+
+            // Enable/disable excuse upload based on status
+            const excuseContainer = row.querySelector('.excuse-upload-container');
+            const excuseBtn = excuseContainer.querySelector('.excuse-upload-btn');
+            const excuseInfo = excuseContainer.querySelector('.excuse-file-info');
+            const removeBtn = excuseContainer.querySelector('.btn-remove-excuse');
+
+            if (status === 'Excused') {
+                if (excuseBtn) excuseBtn.disabled = false;
+                if (excuseInfo) excuseInfo.classList.remove('disabled');
+                if (removeBtn) removeBtn.disabled = false;
+            } else {
+                if (excuseBtn) excuseBtn.disabled = true;
+                if (excuseInfo) excuseInfo.classList.add('disabled');
+                if (removeBtn) removeBtn.disabled = true;
+            }
         }
 
         function markAllStatus(status) {
@@ -858,6 +1316,192 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
                 setStatus(student.id, status);
             });
             showMessage('success', `All students marked as ${status}`);
+        }
+
+        function openExcuseModal(studentId) {
+            // Check if status is "Excused"
+            const row = document.querySelector(`tr[data-student-id="${studentId}"]`);
+            const statusBtn = row.querySelector('.btn-status.active');
+            const status = statusBtn ? statusBtn.textContent.trim().replace(/\s+/g, ' ').split(' ').pop() : 'Present';
+
+            if (status !== 'Excused') {
+                showMessage('error', 'Please set status to "Excused" first before uploading excuse letter');
+                return;
+            }
+
+            currentUploadStudent = studentId;
+            selectedFile = null;
+            document.getElementById('excuseFileInput').value = '';
+            document.getElementById('selectedFileInfo').style.display = 'none';
+            document.getElementById('uploadBtn').disabled = true;
+            document.getElementById('excuseModal').classList.add('active');
+        }
+
+        function closeExcuseModal() {
+            document.getElementById('excuseModal').classList.remove('active');
+            currentUploadStudent = null;
+            selectedFile = null;
+        }
+
+        function handleFileSelect(input) {
+            const file = input.files[0];
+            if (!file) return;
+
+            // Validate file type
+            const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'application/pdf'];
+            if (!allowedTypes.includes(file.type)) {
+                showMessage('error', 'Invalid file type. Only JPG, PNG, and PDF are allowed.');
+                return;
+            }
+
+            // Validate file size (5MB)
+            if (file.size > 5 * 1024 * 1024) {
+                showMessage('error', 'File too large. Maximum size is 5MB.');
+                return;
+            }
+
+            selectedFile = file;
+
+            // Show selected file info
+            const fileInfo = document.getElementById('selectedFileInfo');
+            const fileIcon = file.type === 'application/pdf' ? 'file-pdf' : 'file-image';
+            const fileSize = (file.size / 1024).toFixed(2);
+
+            fileInfo.innerHTML = `
+                <div class="selected-file">
+                    <i class="fas fa-${fileIcon}"></i>
+                    <div style="flex: 1;">
+                        <strong>${file.name}</strong>
+                        <p style="color: var(--text-secondary); font-size: 0.85rem; margin: 0;">${fileSize} KB</p>
+                    </div>
+                </div>
+            `;
+            fileInfo.style.display = 'block';
+            document.getElementById('uploadBtn').disabled = false;
+        }
+
+        // Drag and drop functionality
+        const fileUploadArea = document.getElementById('fileUploadArea');
+
+        fileUploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            fileUploadArea.classList.add('dragover');
+        });
+
+        fileUploadArea.addEventListener('dragleave', () => {
+            fileUploadArea.classList.remove('dragover');
+        });
+
+        fileUploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            fileUploadArea.classList.remove('dragover');
+
+            const file = e.dataTransfer.files[0];
+            if (file) {
+                const input = document.getElementById('excuseFileInput');
+                const dataTransfer = new DataTransfer();
+                dataTransfer.items.add(file);
+                input.files = dataTransfer.files;
+                handleFileSelect(input);
+            }
+        });
+
+        function uploadExcuseLetter() {
+            if (!selectedFile || !currentUploadStudent) return;
+
+            const uploadBtn = document.getElementById('uploadBtn');
+            uploadBtn.disabled = true;
+            uploadBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Uploading...';
+
+            const formData = new FormData();
+            formData.append('ajax', '1');
+            formData.append('action', 'upload_excuse');
+            formData.append('student_id', currentUploadStudent);
+            formData.append('attendance_date', document.getElementById('attendance_date').value);
+            formData.append('excuse_file', selectedFile);
+
+            fetch('attendance.php', {
+                    method: 'POST',
+                    body: formData
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        showMessage('success', 'Excuse letter uploaded successfully');
+
+                        // Update student data
+                        const studentIndex = studentsData.findIndex(s => s.id == currentUploadStudent);
+                        if (studentIndex !== -1) {
+                            studentsData[studentIndex].excuse_file = data.data.filepath;
+                        }
+
+                        // Update UI
+                        const container = document.querySelector(`.excuse-upload-container[data-student-id="${currentUploadStudent}"]`);
+                        const fileName = data.data.filepath.split('/').pop();
+                        container.innerHTML = `
+                        <div class="excuse-file-info">
+                            <i class="fas fa-file-alt"></i>
+                            <a href="${data.data.filepath}" target="_blank">View File</a>
+                            <button class="btn-remove-excuse" onclick="removeExcuse(${currentUploadStudent})">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                        </div>
+                    `;
+
+                        closeExcuseModal();
+                    } else {
+                        showMessage('error', data.message);
+                        uploadBtn.disabled = false;
+                        uploadBtn.innerHTML = '<i class="fas fa-upload"></i> Upload';
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    showMessage('error', 'Failed to upload excuse letter');
+                    uploadBtn.disabled = false;
+                    uploadBtn.innerHTML = '<i class="fas fa-upload"></i> Upload';
+                });
+        }
+
+        function removeExcuse(studentId) {
+            if (!confirm('Are you sure you want to remove this excuse letter?')) return;
+
+            const formData = new FormData();
+            formData.append('ajax', '1');
+            formData.append('action', 'delete_excuse');
+            formData.append('student_id', studentId);
+            formData.append('attendance_date', document.getElementById('attendance_date').value);
+
+            fetch('attendance.php', {
+                    method: 'POST',
+                    body: formData
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        showMessage('success', 'Excuse letter removed successfully');
+
+                        // Update student data
+                        const studentIndex = studentsData.findIndex(s => s.id == studentId);
+                        if (studentIndex !== -1) {
+                            studentsData[studentIndex].excuse_file = null;
+                        }
+
+                        // Update UI
+                        const container = document.querySelector(`.excuse-upload-container[data-student-id="${studentId}"]`);
+                        container.innerHTML = `
+                        <button class="excuse-upload-btn" onclick="openExcuseModal(${studentId})">
+                            <i class="fas fa-upload"></i> Upload Excuse
+                        </button>
+                    `;
+                    } else {
+                        showMessage('error', data.message);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    showMessage('error', 'Failed to remove excuse letter');
+                });
         }
 
         function saveAllAttendance() {
@@ -882,7 +1526,8 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
                     student_id: student.id,
                     status: status,
                     time_in: time_in,
-                    remarks: remarks
+                    remarks: remarks,
+                    excuse_file: student.excuse_file || null
                 });
             });
 
@@ -904,26 +1549,35 @@ $sections = $conn->query("SELECT id, name FROM sections WHERE is_active = 1 ORDE
             formData.append('attendance_data', JSON.stringify(attendanceData));
 
             fetch('attendance.php', {
-                method: 'POST',
-                body: formData
-            })
-            .then(response => response.json())
-            .then(data => {
-                showMessage(data.success ? 'success' : 'error', data.message);
-                if (data.success) {
-                    setTimeout(() => loadStudents(), 1500);
-                }
-            })
-            .catch(error => {
-                console.error('Error:', error);
-                showMessage('error', 'Failed to save attendance');
-            })
-            .finally(() => {
-                isSaving = false;
-                saveBtn.disabled = false;
-                saveBtn.innerHTML = originalContent;
-            });
+                    method: 'POST',
+                    body: formData
+                })
+                .then(response => response.json())
+                .then(data => {
+                    showMessage(data.success ? 'success' : 'error', data.message);
+                    if (data.success) {
+                        setTimeout(() => loadStudents(), 1500);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    showMessage('error', 'Failed to save attendance');
+                })
+                .finally(() => {
+                    isSaving = false;
+                    saveBtn.disabled = false;
+                    saveBtn.innerHTML = originalContent;
+                });
+        }
+
+        // Close modal when clicking outside
+        window.onclick = function(event) {
+            const modal = document.getElementById('excuseModal');
+            if (event.target === modal) {
+                closeExcuseModal();
+            }
         }
     </script>
 </body>
+
 </html>
