@@ -1,9 +1,17 @@
 <?php
+ob_start();
 require_once 'config.php';
 requireLogin();
 
 $conn = getDBConnection();
-$user_id = $_SESSION['user_id'];
+$user_id = $_SESSION['user_id'] ?? null;
+
+// Verify user_id exists in session
+if (!$user_id) {
+    session_destroy();
+    header("Location: login.php");
+    exit;
+}
 
 // Get user info
 $userQuery = $conn->prepare("SELECT fullname, email, role FROM users WHERE id = ?");
@@ -11,6 +19,18 @@ $userQuery->bind_param("i", $user_id);
 $userQuery->execute();
 $result = $userQuery->get_result();
 $user = $result->fetch_assoc();
+
+// If user not found, redirect to login
+if (!$user) {
+    session_destroy();
+    header("Location: login.php");
+    exit;
+}
+
+// Set default values to prevent null errors
+$user['fullname'] = $user['fullname'] ?? 'Unknown User';
+$user['email'] = $user['email'] ?? '';
+$user['role'] = $user['role'] ?? 'teacher';
 
 // Initialize session filters if not set
 if (!isset($_SESSION['dashboard_filters'])) {
@@ -40,7 +60,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_filters'])) {
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
     ob_clean();
     $action = $_POST['action'] ?? '';
-    
+
     if ($action === 'get_courses') {
         $department_id = (int)$_POST['department_id'];
         $stmt = $conn->prepare("SELECT id, code, name FROM courses WHERE department_id = ? AND is_active = 1 ORDER BY name");
@@ -96,17 +116,24 @@ if (!empty($params)) {
     $stmt = $conn->prepare($studentQuery);
     $stmt->bind_param($types, ...$params);
     $stmt->execute();
-    $totalStudents = $stmt->get_result()->fetch_assoc()['total'];
+    $result = $stmt->get_result();
+    $totalStudentsRow = $result->fetch_assoc();
+    $totalStudents = (int)($totalStudentsRow['total'] ?? 0);
 } else {
-    $totalStudents = $conn->query($studentQuery)->fetch_assoc()['total'];
+    $result = $conn->query($studentQuery);
+    $totalStudentsRow = $result->fetch_assoc();
+    $totalStudents = (int)($totalStudentsRow['total'] ?? 0);
 }
 
 // Get today's attendance with filters
 $today = date('Y-m-d');
-$todayQuery = "SELECT COUNT(DISTINCT a.student_id) as present 
+$todayQuery = "SELECT 
+    COUNT(DISTINCT CASE WHEN a.status = 'Present' THEN a.student_id END) as present,
+    COUNT(DISTINCT CASE WHEN a.status = 'Late' THEN a.student_id END) as late,
+    COUNT(DISTINCT a.student_id) as total_attended
     FROM attendance a 
     JOIN students s ON a.student_id = s.id 
-    WHERE a.attendance_date = ? AND a.status IN ('Present', 'Late') AND $whereClause";
+    WHERE a.attendance_date = ? AND $whereClause";
 
 $todayParams = array_merge([$today], $params);
 $todayTypes = "s" . $types;
@@ -116,9 +143,14 @@ if (!empty($todayParams)) {
     $stmt->bind_param($todayTypes, ...$todayParams);
 }
 $stmt->execute();
-$todayPresent = $stmt->get_result()->fetch_assoc()['present'];
+$result = $stmt->get_result();
+$todayStats = $result->fetch_assoc();
 
-$todayAbsent = $totalStudents - $todayPresent;
+// Handle null values with defaults
+$todayPresent = (int)($todayStats['present'] ?? 0);
+$todayLate = (int)($todayStats['late'] ?? 0);
+$totalAttended = (int)($todayStats['total_attended'] ?? 0);
+$todayAbsent = max(0, $totalStudents - $totalAttended);
 
 // Get attendance rate for date range with filters
 $attendanceRateQuery = "SELECT 
@@ -134,16 +166,19 @@ $rateTypes = "ss" . $types;
 $stmt = $conn->prepare($attendanceRateQuery);
 $stmt->bind_param($rateTypes, ...$rateParams);
 $stmt->execute();
-$monthAttendance = $stmt->get_result()->fetch_assoc();
+$result = $stmt->get_result();
+$monthAttendance = $result->fetch_assoc();
 
-$attendanceRate = $monthAttendance['total_count'] > 0
-    ? round(($monthAttendance['present_count'] / $monthAttendance['total_count']) * 100, 1)
-    : 0;
+// Handle null values with defaults
+$presentCount = (int)($monthAttendance['present_count'] ?? 0);
+$totalCount = (int)($monthAttendance['total_count'] ?? 0);
+$attendanceRate = $totalCount > 0 ? round(($presentCount / $totalCount) * 100, 1) : 0;
 
 // Get recent attendance (last 7 days) with filters
 $chartQuery = "SELECT 
     DATE_FORMAT(a.attendance_date, '%b %d') as date_label,
-    COUNT(CASE WHEN a.status IN ('Present', 'Late') THEN 1 END) as present,
+    COUNT(CASE WHEN a.status = 'Present' THEN 1 END) as present,
+    COUNT(CASE WHEN a.status = 'Late' THEN 1 END) as late,
     COUNT(CASE WHEN a.status = 'Absent' THEN 1 END) as absent
     FROM attendance a
     JOIN students s ON a.student_id = s.id
@@ -162,11 +197,13 @@ if (!empty($params)) {
 
 $chartLabels = [];
 $presentData = [];
+$lateData = [];
 $absentData = [];
 
 while ($row = $recentQuery->fetch_assoc()) {
     $chartLabels[] = $row['date_label'];
     $presentData[] = (int)$row['present'];
+    $lateData[] = (int)$row['late'];
     $absentData[] = (int)$row['absent'];
 }
 
@@ -211,6 +248,7 @@ if (!empty($filters['department'])) {
     $filter_courses = $stmt->get_result();
 }
 ?>
+
 <!DOCTYPE html>
 <html lang="en">
 
@@ -376,6 +414,204 @@ if (!empty($filters['department'])) {
             font-size: 0.85rem;
             font-weight: 500;
         }
+
+        .sidebar-footer {
+            margin-top: auto;
+            padding: 20px 0;
+        }
+
+        .logout-btn {
+            margin: 24px 12px 0;
+            padding: 12px 20px;
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.1), rgba(255, 111, 145, 0.1));
+            border: 2px solid var(--danger);
+            color: var(--danger);
+            border-radius: 12px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: all 0.3s ease;
+            width: calc(100% - 24px);
+        }
+
+        .logout-btn:hover {
+            background: var(--danger);
+            color: white;
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-md);
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: var(--card-bg);
+            border: 1px solid rgba(157, 78, 221, 0.3);
+            border-radius: 15px;
+            padding: 20px;
+            transition: all 0.3s ease;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-5px);
+            box-shadow: var(--shadow-md);
+        }
+
+        .stat-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 15px;
+        }
+
+        .stat-card-title {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+
+        .stat-card-icon {
+            font-size: 1.5rem;
+        }
+
+        .stat-card-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--text-light);
+            margin-bottom: 10px;
+        }
+
+        .stat-card-change {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .chart-container {
+            background: var(--card-bg);
+            border: 1px solid rgba(157, 78, 221, 0.3);
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 25px;
+        }
+
+        .table-container {
+            background: var(--card-bg);
+            border: 1px solid rgba(157, 78, 221, 0.3);
+            border-radius: 15px;
+            padding: 20px;
+            overflow-x: auto;
+        }
+
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .table thead th {
+            background: rgba(157, 78, 221, 0.2);
+            color: var(--text-light);
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 0.85rem;
+        }
+
+        .table tbody td {
+            padding: 12px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            color: var(--text-light);
+        }
+
+        .table tbody tr:hover {
+            background: rgba(157, 78, 221, 0.1);
+        }
+
+        .status-badge {
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            display: inline-block;
+        }
+
+        .status-present {
+            background: rgba(0, 255, 136, 0.2);
+            color: var(--success);
+        }
+
+        .status-late {
+            background: rgba(255, 193, 7, 0.2);
+            color: var(--warning);
+        }
+
+        .status-absent {
+            background: rgba(255, 71, 87, 0.2);
+            color: var(--error);
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-secondary);
+        }
+
+        .empty-state i {
+            font-size: 3rem;
+            margin-bottom: 15px;
+            opacity: 0.3;
+        }
+
+        .message-box {
+            padding: 15px 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            animation: slideIn 0.3s ease;
+        }
+
+        .message-box.success {
+            background: rgba(0, 255, 136, 0.1);
+            border: 1px solid var(--success);
+            color: var(--success);
+        }
+
+        .message-box.error {
+            background: rgba(255, 71, 87, 0.1);
+            border: 1px solid var(--error);
+            color: var(--error);
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateY(-20px);
+                opacity: 0;
+            }
+
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
     </style>
 </head>
 
@@ -384,7 +620,7 @@ if (!empty($filters['department'])) {
         <aside class="sidebar">
             <div class="sidebar-header">
                 <h2>Attendance System</h2>
-                <p><?php echo htmlspecialchars($user['role']); ?></p>
+                <p><?php echo htmlspecialchars($_SESSION['role']); ?></p>
             </div>
 
             <nav class="sidebar-nav">
@@ -448,56 +684,56 @@ if (!empty($filters['department'])) {
                 </div>
 
                 <?php if (!empty($filters['department']) || !empty($filters['course']) || !empty($filters['year']) || !empty($filters['section'])): ?>
-                <div class="active-filters">
-                    <span style="color: var(--text-secondary); font-size: 0.85rem;">Active Filters:</span>
-                    <?php if (!empty($filters['department'])): 
-                        $deptStmt = $conn->prepare("SELECT code, name FROM departments WHERE id = ?");
-                        $deptStmt->bind_param("i", $filters['department']);
-                        $deptStmt->execute();
-                        $deptInfo = $deptStmt->get_result()->fetch_assoc();
-                    ?>
-                        <span class="filter-badge">
-                            <i class="fas fa-building"></i>
-                            <?php echo htmlspecialchars($deptInfo['code']); ?>
-                        </span>
-                    <?php endif; ?>
-                    
-                    <?php if (!empty($filters['course'])): 
-                        $courseStmt = $conn->prepare("SELECT code FROM courses WHERE id = ?");
-                        $courseStmt->bind_param("i", $filters['course']);
-                        $courseStmt->execute();
-                        $courseInfo = $courseStmt->get_result()->fetch_assoc();
-                    ?>
-                        <span class="filter-badge">
-                            <i class="fas fa-book"></i>
-                            <?php echo htmlspecialchars($courseInfo['code']); ?>
-                        </span>
-                    <?php endif; ?>
-                    
-                    <?php if (!empty($filters['year'])): ?>
-                        <span class="filter-badge">
-                            <i class="fas fa-graduation-cap"></i>
-                            <?php echo htmlspecialchars($filters['year']); ?>
-                        </span>
-                    <?php endif; ?>
-                    
-                    <?php if (!empty($filters['section'])): 
-                        $secStmt = $conn->prepare("SELECT name FROM sections WHERE id = ?");
-                        $secStmt->bind_param("i", $filters['section']);
-                        $secStmt->execute();
-                        $secInfo = $secStmt->get_result()->fetch_assoc();
-                    ?>
-                        <span class="filter-badge">
-                            <i class="fas fa-users"></i>
-                            Section <?php echo htmlspecialchars($secInfo['name']); ?>
-                        </span>
-                    <?php endif; ?>
-                </div>
+                    <div class="active-filters">
+                        <span style="color: var(--text-secondary); font-size: 0.85rem;">Active Filters:</span>
+                        <?php if (!empty($filters['department'])):
+                            $deptStmt = $conn->prepare("SELECT code, name FROM departments WHERE id = ?");
+                            $deptStmt->bind_param("i", $filters['department']);
+                            $deptStmt->execute();
+                            $deptInfo = $deptStmt->get_result()->fetch_assoc();
+                        ?>
+                            <span class="filter-badge">
+                                <i class="fas fa-building"></i>
+                                <?php echo htmlspecialchars($deptInfo['code']); ?>
+                            </span>
+                        <?php endif; ?>
+
+                        <?php if (!empty($filters['course'])):
+                            $courseStmt = $conn->prepare("SELECT code FROM courses WHERE id = ?");
+                            $courseStmt->bind_param("i", $filters['course']);
+                            $courseStmt->execute();
+                            $courseInfo = $courseStmt->get_result()->fetch_assoc();
+                        ?>
+                            <span class="filter-badge">
+                                <i class="fas fa-book"></i>
+                                <?php echo htmlspecialchars($courseInfo['code']); ?>
+                            </span>
+                        <?php endif; ?>
+
+                        <?php if (!empty($filters['year'])): ?>
+                            <span class="filter-badge">
+                                <i class="fas fa-graduation-cap"></i>
+                                <?php echo htmlspecialchars($filters['year']); ?>
+                            </span>
+                        <?php endif; ?>
+
+                        <?php if (!empty($filters['section'])):
+                            $secStmt = $conn->prepare("SELECT name FROM sections WHERE id = ?");
+                            $secStmt->bind_param("i", $filters['section']);
+                            $secStmt->execute();
+                            $secInfo = $secStmt->get_result()->fetch_assoc();
+                        ?>
+                            <span class="filter-badge">
+                                <i class="fas fa-users"></i>
+                                Section <?php echo htmlspecialchars($secInfo['name']); ?>
+                            </span>
+                        <?php endif; ?>
+                    </div>
                 <?php endif; ?>
 
                 <form method="POST" id="filterForm" class="filter-content">
                     <input type="hidden" name="update_filters" value="1">
-                    
+
                     <div class="filter-grid">
                         <div class="filter-group">
                             <label>Date From</label>
@@ -605,7 +841,24 @@ if (!empty($filters['department'])) {
                     </div>
                     <div class="stat-card-value"><?php echo number_format($todayPresent); ?></div>
                     <div class="stat-card-change">
-                        <i class="fas fa-calendar-day"></i> <?php echo date('F d, Y'); ?>
+                        <i class="fas fa-calendar-check"></i> On time arrivals
+                    </div>
+                </div>
+
+                <div class="stat-card">
+                    <div class="stat-card-header">
+                        <div class="stat-card-title">Late Today</div>
+                        <div class="stat-card-icon" style="color: var(--warning);">
+                            <i class="fas fa-clock"></i>
+                        </div>
+                    </div>
+                    <div class="stat-card-value"><?php echo number_format($todayLate); ?></div>
+                    <div class="stat-card-change">
+                        <?php if ($todayLate > 0): ?>
+                            <i class="fas fa-exclamation-circle"></i> Late arrivals
+                        <?php else: ?>
+                            <i class="fas fa-check-circle"></i> No late students
+                        <?php endif; ?>
                     </div>
                 </div>
 
@@ -621,7 +874,7 @@ if (!empty($filters['department'])) {
                         <?php if ($todayAbsent > 0): ?>
                             <i class="fas fa-exclamation-triangle"></i> Needs attention
                         <?php else: ?>
-                            <i class="fas fa-check-circle"></i> All present
+                            <i class="fas fa-check-circle"></i> All accounted
                         <?php endif; ?>
                     </div>
                 </div>
@@ -644,6 +897,11 @@ if (!empty($filters['department'])) {
                 <h3 style="margin-bottom: 20px; color: var(--text-light); display: flex; align-items: center; gap: 10px;">
                     <i class="fas fa-chart-area" style="color: var(--primary-blue);"></i>
                     7-Day Attendance Trend
+                    <span style="font-size: 0.75rem; color: var(--text-secondary); margin-left: auto;">
+                        <span style="color: var(--success);">●</span> Present
+                        <span style="color: var(--warning); margin-left: 10px;">●</span> Late
+                        <span style="color: var(--error); margin-left: 10px;">●</span> Absent
+                    </span>
                 </h3>
                 <?php if (count($chartLabels) > 0): ?>
                     <canvas id="attendanceChart" height="80"></canvas>
@@ -707,217 +965,233 @@ if (!empty($filters['department'])) {
     </div>
 
     <script>
-function logout() {
-    if (confirm('Are you sure you want to logout?')) {
-        window.location.href = 'logout.php';
-    }
-}
+        function logout() {
+            if (confirm('Are you sure you want to logout?')) {
+                window.location.href = 'logout.php';
+            }
+        }
 
-function showMessage(type, message) {
-    const container = document.getElementById('message-container');
-    const messageBox = document.createElement('div');
-    messageBox.className = `message-box ${type}`;
-    messageBox.innerHTML = `
+        function showMessage(type, message) {
+            const container = document.getElementById('message-container');
+            const messageBox = document.createElement('div');
+            messageBox.className = `message-box ${type}`;
+            messageBox.innerHTML = `
         <i class="fas fa-${type === 'success' ? 'check-circle' : 'exclamation-circle'}"></i>
         <span>${message}</span>
     `;
 
-    container.innerHTML = '';
-    container.appendChild(messageBox);
+            container.innerHTML = '';
+            container.appendChild(messageBox);
 
-    setTimeout(() => {
-        messageBox.style.opacity = '0';
-        setTimeout(() => messageBox.remove(), 300);
-    }, 3000);
-}
+            setTimeout(() => {
+                messageBox.style.opacity = '0';
+                setTimeout(() => messageBox.remove(), 300);
+            }, 3000);
+        }
 
-function toggleFilters() {
-    const filterContent = document.querySelector('.filter-content');
-    const filterIcon = document.getElementById('filterIcon');
-    const filterToggleText = document.getElementById('filterToggleText');
+        function toggleFilters() {
+            const filterContent = document.querySelector('.filter-content');
+            const filterIcon = document.getElementById('filterIcon');
+            const filterToggleText = document.getElementById('filterToggleText');
 
-    filterContent.classList.toggle('active');
+            filterContent.classList.toggle('active');
 
-    if (filterContent.classList.contains('active')) {
-        filterIcon.classList.remove('fa-chevron-down');
-        filterIcon.classList.add('fa-chevron-up');
-        filterToggleText.textContent = 'Hide Filters';
-    } else {
-        filterIcon.classList.remove('fa-chevron-up');
-        filterIcon.classList.add('fa-chevron-down');
-        filterToggleText.textContent = 'Show Filters';
-    }
-}
+            if (filterContent.classList.contains('active')) {
+                filterIcon.classList.remove('fa-chevron-down');
+                filterIcon.classList.add('fa-chevron-up');
+                filterToggleText.textContent = 'Hide Filters';
+            } else {
+                filterIcon.classList.remove('fa-chevron-up');
+                filterIcon.classList.add('fa-chevron-down');
+                filterToggleText.textContent = 'Show Filters';
+            }
+        }
 
-function loadFilterCourses() {
-    const departmentSelect = document.getElementById('filter_department');
-    const courseSelect = document.getElementById('filter_course');
-    const departmentId = departmentSelect.value;
+        function loadFilterCourses() {
+            const departmentSelect = document.getElementById('filter_department');
+            const courseSelect = document.getElementById('filter_course');
+            const departmentId = departmentSelect.value;
 
-    courseSelect.innerHTML = '<option value="">All Courses</option>';
+            courseSelect.innerHTML = '<option value="">All Courses</option>';
 
-    if (departmentId) {
-        courseSelect.disabled = true;
+            if (departmentId) {
+                courseSelect.disabled = true;
 
-        const formData = new FormData();
-        formData.append('ajax', '1');
-        formData.append('action', 'get_courses');
-        formData.append('department_id', departmentId);
+                const formData = new FormData();
+                formData.append('ajax', '1');
+                formData.append('action', 'get_courses');
+                formData.append('department_id', departmentId);
 
-        fetch('dashboard.php', {
-            method: 'POST',
-            body: formData
-        })
-        .then(response => response.json())
-        .then(data => {
-            if (data.success && data.data) {
-                data.data.forEach(course => {
-                    const option = document.createElement('option');
-                    option.value = course.id;
-                    option.textContent = course.code + ' - ' + course.name;
-                    courseSelect.appendChild(option);
+                fetch('dashboard.php', {
+                        method: 'POST',
+                        body: formData
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success && data.data) {
+                            data.data.forEach(course => {
+                                const option = document.createElement('option');
+                                option.value = course.id;
+                                option.textContent = course.code + ' - ' + course.name;
+                                courseSelect.appendChild(option);
+                            });
+                        }
+                        courseSelect.disabled = false;
+                    })
+                    .catch(error => {
+                        console.error('Error loading courses:', error);
+                        courseSelect.disabled = false;
+                        showMessage('error', 'Failed to load courses');
+                    });
+            }
+        }
+
+        function clearFilters() {
+            document.getElementById('filter_department').value = '';
+            document.getElementById('filter_course').value = '';
+            document.getElementById('filter_year').value = '';
+            document.getElementById('filter_section').value = '';
+
+            const today = new Date();
+            const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+            const formattedFirstDay = firstDay.toISOString().split('T')[0];
+            const formattedToday = today.toISOString().split('T')[0];
+
+            document.getElementById('filter_date_from').value = formattedFirstDay;
+            document.getElementById('filter_date_to').value = formattedToday;
+
+            document.getElementById('filterForm').submit();
+        }
+
+        window.addEventListener('DOMContentLoaded', function() {
+            const chartLabels = <?php echo json_encode($chartLabels); ?>;
+            const presentData = <?php echo json_encode($presentData); ?>;
+            const lateData = <?php echo json_encode($lateData); ?>;
+            const absentData = <?php echo json_encode($absentData); ?>;
+
+            if (chartLabels.length > 0) {
+                const ctx = document.getElementById('attendanceChart').getContext('2d');
+
+                new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: chartLabels,
+                        datasets: [{
+                            label: 'Present',
+                            data: presentData,
+                            backgroundColor: 'rgba(0, 255, 136, 0.2)',
+                            borderColor: '#00FF88',
+                            borderWidth: 3,
+                            fill: true,
+                            tension: 0.4,
+                            pointRadius: 5,
+                            pointBackgroundColor: '#00FF88',
+                            pointBorderColor: '#00FF88',
+                            pointHoverRadius: 7,
+                            pointHoverBackgroundColor: '#00FF88',
+                            pointHoverBorderColor: '#fff',
+                            pointHoverBorderWidth: 2
+                        }, {
+                            label: 'Late',
+                            data: lateData,
+                            backgroundColor: 'rgba(255, 179, 61, 0.2)',
+                            borderColor: '#FFB33D',
+                            borderWidth: 3,
+                            fill: true,
+                            tension: 0.4,
+                            pointRadius: 5,
+                            pointBackgroundColor: '#FFB33D',
+                            pointBorderColor: '#FFB33D',
+                            pointHoverRadius: 7,
+                            pointHoverBackgroundColor: '#FFB33D',
+                            pointHoverBorderColor: '#fff',
+                            pointHoverBorderWidth: 2
+                        }, {
+                            label: 'Absent',
+                            data: absentData,
+                            backgroundColor: 'rgba(255, 71, 87, 0.2)',
+                            borderColor: '#FF4757',
+                            borderWidth: 3,
+                            fill: true,
+                            tension: 0.4,
+                            pointRadius: 5,
+                            pointBackgroundColor: '#FF4757',
+                            pointBorderColor: '#FF4757',
+                            pointHoverRadius: 7,
+                            pointHoverBackgroundColor: '#FF4757',
+                            pointHoverBorderColor: '#fff',
+                            pointHoverBorderWidth: 2
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: true,
+                        interaction: {
+                            mode: 'index',
+                            intersect: false
+                        },
+                        plugins: {
+                            legend: {
+                                display: true,
+                                position: 'top',
+                                labels: {
+                                    color: '#E0E0E0',
+                                    font: {
+                                        size: 13,
+                                        family: 'Poppins'
+                                    },
+                                    padding: 15,
+                                    usePointStyle: true
+                                }
+                            },
+                            tooltip: {
+                                backgroundColor: 'rgba(30, 30, 40, 0.9)',
+                                titleColor: '#fff',
+                                bodyColor: '#fff',
+                                borderColor: 'rgba(157, 78, 221, 0.5)',
+                                borderWidth: 1,
+                                padding: 12,
+                                displayColors: true,
+                                callbacks: {
+                                    label: function(context) {
+                                        return context.dataset.label + ': ' + context.parsed.y + ' student(s)';
+                                    }
+                                }
+                            }
+                        },
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                ticks: {
+                                    stepSize: 1,
+                                    color: 'rgba(255, 255, 255, 0.7)',
+                                    font: {
+                                        size: 12,
+                                        family: 'Poppins'
+                                    }
+                                },
+                                grid: {
+                                    color: 'rgba(255, 255, 255, 0.1)',
+                                    drawBorder: false
+                                }
+                            },
+                            x: {
+                                ticks: {
+                                    color: 'rgba(255, 255, 255, 0.7)',
+                                    font: {
+                                        size: 12,
+                                        family: 'Poppins'
+                                    }
+                                },
+                                grid: {
+                                    display: false
+                                }
+                            }
+                        }
+                    }
                 });
             }
-            courseSelect.disabled = false;
-        })
-        .catch(error => {
-            console.error('Error loading courses:', error);
-            courseSelect.disabled = false;
-            showMessage('error', 'Failed to load courses');
         });
-    }
-}
-
-function clearFilters() {
-    document.getElementById('filter_department').value = '';
-    document.getElementById('filter_course').value = '';
-    document.getElementById('filter_year').value = '';
-    document.getElementById('filter_section').value = '';
-    
-    const today = new Date();
-    const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
-    const formattedFirstDay = firstDay.toISOString().split('T')[0];
-    const formattedToday = today.toISOString().split('T')[0];
-    
-    document.getElementById('filter_date_from').value = formattedFirstDay;
-    document.getElementById('filter_date_to').value = formattedToday;
-
-    document.getElementById('filterForm').submit();
-}
-
-window.addEventListener('DOMContentLoaded', function() {
-    const chartLabels = <?php echo json_encode($chartLabels); ?>;
-    const presentData = <?php echo json_encode($presentData); ?>;
-    const absentData = <?php echo json_encode($absentData); ?>;
-
-    if (chartLabels.length > 0) {
-        const ctx = document.getElementById('attendanceChart').getContext('2d');
-
-        new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: chartLabels,
-                datasets: [{
-                    label: 'Present',
-                    data: presentData,
-                    backgroundColor: 'rgba(0, 255, 136, 0.2)',
-                    borderColor: '#00FF88',
-                    borderWidth: 3,
-                    fill: true,
-                    tension: 0.4,
-                    pointRadius: 5,
-                    pointBackgroundColor: '#00FF88',
-                    pointBorderColor: '#00FF88',
-                    pointHoverRadius: 7,
-                    pointHoverBackgroundColor: '#00FF88',
-                    pointHoverBorderColor: '#fff',
-                    pointHoverBorderWidth: 2
-                }, {
-                    label: 'Absent',
-                    data: absentData,
-                    backgroundColor: 'rgba(255, 71, 87, 0.2)',
-                    borderColor: '#FF4757',
-                    borderWidth: 3,
-                    fill: true,
-                    tension: 0.4,
-                    pointRadius: 5,
-                    pointBackgroundColor: '#FF4757',
-                    pointBorderColor: '#FF4757',
-                    pointHoverRadius: 7,
-                    pointHoverBackgroundColor: '#FF4757',
-                    pointHoverBorderColor: '#fff',
-                    pointHoverBorderWidth: 2
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: true,
-                interaction: {
-                    mode: 'index',
-                    intersect: false
-                },
-                plugins: {
-                    legend: {
-                        display: true,
-                        position: 'top',
-                        labels: {
-                            color: '#E0E0E0',
-                            font: {
-                                size: 13,
-                                family: 'Poppins'
-                            },
-                            padding: 15,
-                            usePointStyle: true
-                        }
-                    },
-                    tooltip: {
-                        backgroundColor: 'rgba(30, 30, 40, 0.9)',
-                        titleColor: '#fff',
-                        bodyColor: '#fff',
-                        borderColor: 'rgba(157, 78, 221, 0.5)',
-                        borderWidth: 1,
-                        padding: 12,
-                        displayColors: true,
-                        callbacks: {
-                            label: function(context) {
-                                return context.dataset.label + ': ' + context.parsed.y + ' student(s)';
-                            }
-                        }
-                    }
-                },
-                scales: {
-                    y: {
-                        beginAtZero: true,
-                        ticks: {
-                            stepSize: 1,
-                            color: 'rgba(255, 255, 255, 0.7)',
-                            font: {
-                                size: 12,
-                                family: 'Poppins'
-                            }
-                        },
-                        grid: {
-                            color: 'rgba(255, 255, 255, 0.1)',
-                            drawBorder: false
-                        }
-                    },
-                    x: {
-                        ticks: {
-                            color: 'rgba(255, 255, 255, 0.7)',
-                            font: {
-                                size: 12,
-                                family: 'Poppins'
-                            }
-                        },
-                        grid: {
-                            display: false
-                        }
-                    }
-                }
-            }
-        });
-    }
-});
     </script>
 </body>
 
