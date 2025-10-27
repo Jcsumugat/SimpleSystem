@@ -6,28 +6,24 @@ requireLogin();
 $conn = getDBConnection();
 $user_id = $_SESSION['user_id'] ?? null;
 
-// Verify user_id exists in session
 if (!$user_id) {
     session_destroy();
     header("Location: login.php");
     exit;
 }
 
-// Get user info
 $userQuery = $conn->prepare("SELECT fullname, email, role FROM users WHERE id = ?");
 $userQuery->bind_param("i", $user_id);
 $userQuery->execute();
 $result = $userQuery->get_result();
 $user = $result->fetch_assoc();
 
-// If user not found, redirect to login
 if (!$user) {
     session_destroy();
     header("Location: login.php");
     exit;
 }
 
-// Set default values to prevent null errors
 $user['fullname'] = $user['fullname'] ?? 'Unknown User';
 $user['email'] = $user['email'] ?? '';
 $user['role'] = $user['role'] ?? 'teacher';
@@ -44,7 +40,6 @@ if (!isset($_SESSION['dashboard_filters'])) {
     ];
 }
 
-// Update filters from POST request
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_filters'])) {
     $_SESSION['dashboard_filters'] = [
         'department' => $_POST['filter_department'] ?? '',
@@ -56,7 +51,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_filters'])) {
     ];
 }
 
-// Handle AJAX request for courses
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
     ob_clean();
     $action = $_POST['action'] ?? '';
@@ -79,7 +73,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
 
 $filters = $_SESSION['dashboard_filters'];
 
-// Build WHERE conditions for statistics
 $whereConditions = ["s.is_active = 1"];
 $params = [];
 $types = "";
@@ -110,7 +103,6 @@ if (!empty($filters['section'])) {
 
 $whereClause = implode(" AND ", $whereConditions);
 
-// Get filtered total students
 $studentQuery = "SELECT COUNT(*) as total FROM students s WHERE $whereClause";
 if (!empty($params)) {
     $stmt = $conn->prepare($studentQuery);
@@ -125,11 +117,11 @@ if (!empty($params)) {
     $totalStudents = (int)($totalStudentsRow['total'] ?? 0);
 }
 
-// Get today's attendance with filters
 $today = date('Y-m-d');
 $todayQuery = "SELECT 
     COUNT(DISTINCT CASE WHEN a.status = 'Present' THEN a.student_id END) as present,
     COUNT(DISTINCT CASE WHEN a.status = 'Late' THEN a.student_id END) as late,
+    COUNT(DISTINCT CASE WHEN a.status = 'Absent' THEN a.student_id END) as absent,
     COUNT(DISTINCT a.student_id) as total_attended
     FROM attendance a 
     JOIN students s ON a.student_id = s.id 
@@ -149,8 +141,8 @@ $todayStats = $result->fetch_assoc();
 // Handle null values with defaults
 $todayPresent = (int)($todayStats['present'] ?? 0);
 $todayLate = (int)($todayStats['late'] ?? 0);
+$todayAbsent = (int)($todayStats['absent'] ?? 0); 
 $totalAttended = (int)($todayStats['total_attended'] ?? 0);
-$todayAbsent = max(0, $totalStudents - $totalAttended);
 
 // Get attendance rate for date range with filters
 $attendanceRateQuery = "SELECT 
